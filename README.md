@@ -1,12 +1,34 @@
-# RM Rune Simulator · 战队自瞄仿真
+# RM Rune Simulator · Combat 战队自瞄调试仿真
 
-基于 [Blackjack200 / Daedalus](https://github.com/Blackjack200/bevy_robomaster_simulator) 的战队适配版本，主要用于 **Windows 仿真端 + ROS 2 Jazzy 自瞄端**的图像、云台控制和小陀螺闭环联调，保留能量机关场景。
+本仓库由 **南京理工大学江阴校区 Combat 战队**维护，用于战队自瞄算法的仿真调试与闭环联调。项目基于 [Blackjack200 / Daedalus](https://github.com/Blackjack200/bevy_robomaster_simulator) 适配，重点验证图像采集、检测与跟踪、云台控制、小陀螺预测及开火表现，保留能量机关场景。
+
+**战队实际采用双机运行：Windows 本机使用 NVIDIA GeForce RTX 5070 Ti 显卡运行仿真，Linux 主机运行自瞄算法，两机通过局域网 ROS 2 Jazzy / FastDDS 通信。** 自瞄算法部分将稍后上传到独立仓库，发布后在此补充链接；本仓库负责仿真端、接口定义及仿真部署工具。
 
 参考介绍：[河北科技大学 Actor&Thinker 战队 RM2026 视觉算法仿真器开源](https://bbs.robomaster.com/article/1887395?source=4)。原作者为 Blackjack200 / Actor&Thinker；本仓库维护者为 [MalzaharGeng](https://github.com/MalzaharGeng)。项目沿用 **AGPL-3.0**，自定义消息包保留上游 Apache-2.0 许可证。
 
 **推荐先下载便携包运行。** 仓库包含全部仿真源码、5 个模型/音效资源、消息定义和依赖锁文件；可执行程序及 ROS DLL 放在版本化的 [Release](https://github.com/MalzaharGeng/RM_rune_simulator/releases/tag/v2026.10.23)。首次获取需要联网，之后可离线运行。便携包无需安装 Rust、ROS、Python 或 Visual Studio；需要 Windows x64 和支持 Bevy/wgpu 的显卡驱动。
 
 > 仓库名沿用 rune，但当前默认实验是 **4 m 前方、7.5 rad/s 恒速旋转的敌方步兵**。外部自瞄算法、神经网络权重、真机驱动和 PlotJuggler 本体不在本仓库中。单独运行可观察场景和真值；自动瞄准/自动开火需要自行接入自瞄节点。
+
+## 战队双机运行方式
+
+```mermaid
+flowchart LR
+    WIN["Windows 本机<br/>RTX 5070 Ti<br/>Daedalus 仿真渲染、云台与弹丸"]
+    LIN["Linux 主机<br/>Ubuntu 24.04.3 / ROS 2 Jazzy<br/>Combat 自瞄算法（独立仓库待发布）"]
+    DBG["Linux 调试工具<br/>真值记录 / PlotJuggler"]
+    WIN -->|"ROS 2：图像、内参、位姿"| LIN
+    LIN -->|"ROS 2：GimbalCmd 云台与开火建议"| WIN
+    WIN -.->|"UDP 9870：诊断真值"| DBG
+```
+
+| 机器 | 已有配置 | 在联调中的职责 |
+|---|---|---|
+| Windows 仿真机 | RTX 5070 Ti；本次运行日志识别为 RTX 5070 Ti Laptop GPU | GPU 渲染、模拟相机、物理/云台执行、图像与姿态发布 |
+| Linux 自瞄主机 | Ubuntu 24.04.3 LTS / x86_64、约 31 GiB 内存、Intel 集显，无独显 | 运行自瞄、接收图像与姿态、输出控制指令；提供资料中的配置使用 OpenVINO 2024.6.0 / CPU 推理 |
+| 两机通信 | ROS 2 Jazzy / FastDDS，使用相同 ROS_DOMAIN_ID（当前为 25） | 图像与控制走 ROS 2，诊断真值单独走 UDP |
+
+Linux 配置根据战队提供的主机资料整理，本次没有远程登录重新检测。GPU 型号记录当前开发设备，不要求其他队员使用完全相同的显卡。双机配置和启动步骤见 [双机联调说明](docs/DEPLOYMENT.md)。
 
 ## 快速运行
 

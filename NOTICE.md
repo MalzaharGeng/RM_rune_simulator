@@ -1,5 +1,7 @@
 # 来源与第三方说明
 
+本仓库的战队适配与维护：南京理工大学江阴校区 Combat 战队（维护者 MalzaharGeng）。用途为 Windows GPU 仿真与 Linux 自瞄主机之间的算法调试和闭环联调。自瞄算法计划在独立仓库发布，链接待补充。
+
 仿真器派生自 Blackjack200 / Actor&Thinker 的 Daedalus / bevy_robomaster_simulator：
 https://github.com/Blackjack200/bevy_robomaster_simulator
 https://bbs.robomaster.com/article/1887395?source=4

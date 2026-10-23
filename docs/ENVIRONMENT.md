@@ -1,5 +1,13 @@
 # 环境与部署
 
+## Combat 战队当前部署
+
+南京理工大学江阴校区 Combat 战队采用 Windows / Linux 双机原生运行。Windows 使用 RTX 5070 Ti 渲染仿真；Linux 主机运行自瞄。当前 Windows 运行日志中的具体设备为 NVIDIA GeForce RTX 5070 Ti Laptop GPU。
+
+战队提供的 Linux 主机资料记录：Ubuntu 24.04.3 LTS（noble）、x86_64、约 31 GiB 内存、Intel Raptor Lake-P UHD Graphics 集显，无独立显卡；软件为 ROS 2 Jazzy、OpenVINO 2024.6.0，所列自瞄配置使用 CPU 推理。资料未给出完整 CPU 型号，不根据集显名称推断 CPU 型号。本次仅核对提供文档，未远程重新探测机器。
+
+本仓库提供 Windows 仿真环境和两端共用的 rm_interfaces；自瞄程序、算法依赖、配置和权重将由后续独立的自瞄仓库说明。跨机连接步骤见 [双机联调说明](DEPLOYMENT.md)。
+
 ## 运行环境
 
 便携包支持 Windows x64；需要有效的图形桌面及显卡驱动。包内包含本机已有 release 可执行文件及其原生依赖，模型/音效已嵌入 exe。程序使用 `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`，其运行 DLL 一并提供。运行入口使用运行包内部路径，测试时没有把 D 盘 ROS/Pixi 目录加入 PATH。
@@ -73,4 +81,4 @@ python tools/image_rate_probe.py /image_compressed 20
 
 运行包针对现有编译产物做了依赖闭包整理和隔离启动验证。整个开发工具链在新 Windows 上的首次安装仍须团队验收；锁定库版本不等于锁定所有驱动、系统更新、Visual Studio 与 LLVM 安装器版本。
 
-Linux 自瞄端建议 Ubuntu 24.04 + ROS 2 Jazzy，并从本仓库编译同版本 rm_interfaces。算法本体及权重由团队自己的算法仓库管理；不从本机 `_linux_src` 快照自动复制，避免混入旧副本、模型和其他项目内容。
+Linux 自瞄端当前使用 Ubuntu 24.04.3 + ROS 2 Jazzy，并应与 Windows 使用同版本 rm_interfaces。算法本体及权重将在战队单独的自瞄仓库发布，链接待补充；本仓库不从 `_linux_src` 快照自动复制算法。

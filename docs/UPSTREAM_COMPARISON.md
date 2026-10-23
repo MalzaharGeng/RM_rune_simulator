@@ -1,5 +1,7 @@
 # 上游对比与改动归因
 
+本仓库为南京理工大学江阴校区 Combat 战队的自瞄调试仿真适配：Windows / RTX 5070 Ti 运行仿真，Linux 主机运行自瞄。自瞄算法将由另一独立仓库发布；这里记录仿真端与上游的关系。
+
 ## 对比基准
 
 - 公开上游：Blackjack200/bevy_robomaster_simulator。
