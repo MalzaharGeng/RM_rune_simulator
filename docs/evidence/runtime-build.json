@@ -1,0 +1,87 @@
+{
+  "executable_source": "existing local release binary, compiled 2026-10-13",
+  "executable_sha256": "dcebd0b5b5913c6931bb9abdb2ac4cd9d6cd4dc00a100e87df38dcf213dc69a0",
+  "dll_count": 316,
+  "missing_pe_dependencies": [],
+  "native_dependencies": [
+    {
+      "name": "fmt",
+      "version": "10.2.1",
+      "build": "h181d51b_0",
+      "license": "MIT",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/fmt-10.2.1-h181d51b_0.conda",
+      "sha256": "4593d75b6a1e0b5b43fdcba6b968537638a6e469521fb4c3073929f973891828",
+      "dlls": [
+        "fmt.dll"
+      ]
+    },
+    {
+      "name": "libzlib",
+      "version": "1.3.1",
+      "build": "h2466b09_2",
+      "license": "Zlib",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/libzlib-1.3.1-h2466b09_2.conda",
+      "sha256": "ba945c6493449bed0e6e29883c4943817f7c79cbff52b83360f7b341277c6402",
+      "dlls": [
+        "zlib.dll"
+      ]
+    },
+    {
+      "name": "openssl",
+      "version": "3.3.2",
+      "build": "h2466b09_0",
+      "license": "Apache-2.0",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/openssl-3.3.2-h2466b09_0.conda",
+      "sha256": "a45c42f3577294e22ac39ddb6ef5a64fd5322e8a6725afefbf4f2b4109340bf9",
+      "dlls": [
+        "libcrypto-3-x64.dll",
+        "libssl-3-x64.dll"
+      ]
+    },
+    {
+      "name": "python",
+      "version": "3.12.3",
+      "build": "h2628c8c_0_cpython",
+      "license": "Python-2.0",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/python-3.12.3-h2628c8c_0_cpython.conda",
+      "sha256": "1a95494abe572a8819c933f978df89f00bde72ea9432d46a70632599e8029ea4",
+      "dlls": [
+        "python312.dll"
+      ]
+    },
+    {
+      "name": "spdlog",
+      "version": "1.12.0",
+      "build": "h64d2f7d_2",
+      "license": "MIT",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/spdlog-1.12.0-h64d2f7d_2.conda",
+      "sha256": "4b582768ebb9d234c0a9e0eae482733f167d53e316f0f48aac19a028a83a8570",
+      "dlls": [
+        "spdlog.dll"
+      ]
+    },
+    {
+      "name": "tinyxml2",
+      "version": "10.0.0",
+      "build": "he0c23c2_2",
+      "license": "Zlib",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/tinyxml2-10.0.0-he0c23c2_2.conda",
+      "sha256": "622e6b974f26eb2f09b9080207c10ed7278c302b229062acb35d67b06d5f1c3d",
+      "dlls": [
+        "tinyxml2.dll"
+      ]
+    },
+    {
+      "name": "yaml",
+      "version": "0.2.5",
+      "build": "h6a83c73_3",
+      "license": "MIT",
+      "url": "https://conda.anaconda.org/conda-forge/win-64/yaml-0.2.5-h6a83c73_3.conda",
+      "sha256": "80ee68c1e7683a35295232ea79bcc87279d31ffeda04a1665efdb43cbd50a309",
+      "dlls": [
+        "yaml.dll"
+      ]
+    }
+  ],
+  "license_note": "Rust and ROS licenses, native license texts and Microsoft runtime terms are included in the archive."
+}

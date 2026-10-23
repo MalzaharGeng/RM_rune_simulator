@@ -1,0 +1,20 @@
+{
+  "ROS_DOMAIN_ID": "25",
+  "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
+  "GT_UDP_ENABLE": "1",
+  "GT_UDP_TARGET": "127.0.0.1:9870",
+  "SPIN_MODE": "slow",
+  "SPIN_SLOW_OMEGA": "7.5",
+  "SPIN_MIN": "4",
+  "SPIN_MAX": "14",
+  "SPIN_T_ACC": "0.50",
+  "ENEMY_X": "0",
+  "ENEMY_Z": "-4",
+  "PIN_LOCAL_INFANTRY": "1",
+  "ARMOR_TILT_DEG": "15",
+  "IMAGE_PUB": "compressed",
+  "JPEG_QUALITY": "100",
+  "CAPTURE_WIDTH": "960",
+  "CAPTURE_HEIGHT": "720",
+  "RUST_LOG": "info,daedalus::dataset::prelude=warn"
+}

@@ -1,0 +1,22 @@
+running 19 tests
+test tests::big_step_matches_small_steps ... ok
+test tests::deterministic_with_seed ... ok
+test tests::default_config_is_minus4_to_4_period_1s ... ok
+test tests::constant_reaches_max ... ok
+test tests::different_seeds_differ ... ok
+test tests::invalid_config_is_fixed ... ok
+test tests::triangle_negative_alpha_max ... ok
+test tests::no_overshoot ... ok
+test tests::omega_within_range ... ok
+test tests::slow_mode_is_constant_omega ... ok
+test tests::regular_alternates ... ok
+test tests::triangle_alpha_max_from_t_acc ... ok
+test tests::triangle_alpha_is_pure_square_wave ... ok
+test tests::triangle_big_step_matches_small_steps ... ok
+test tests::triangle_negative_wobbles_within_t_acc ... ok
+test tests::slope_matches_alpha ... ok
+test tests::triangle_omega_stays_in_range_and_hits_both_ends ... ok
+test tests::triangle_omega_is_integral_of_alpha ... ok
+test tests::triangle_ramp_time_matches_t_acc ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

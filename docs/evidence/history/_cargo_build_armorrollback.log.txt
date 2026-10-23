@@ -1,0 +1,2 @@
+Finished `release` profile [optimized] target(s) in 30.59s
+EXITCODE=0
