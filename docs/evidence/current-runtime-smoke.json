@@ -1,0 +1,26 @@
+[
+  {
+    "mode": "slow",
+    "frames": 350,
+    "complete_armor_frames": 350,
+    "elapsed_s": 2.2072031497955322,
+    "spin_omega_min": 7.5,
+    "spin_omega_max": 7.5,
+    "clean_path": true,
+    "ros_domain_id": 42,
+    "ground_truth_port": 19870,
+    "result": "PASS"
+  },
+  {
+    "mode": "triangle",
+    "frames": 350,
+    "complete_armor_frames": 350,
+    "elapsed_s": 2.239335775375366,
+    "spin_omega_min": -3.9941599033772945,
+    "spin_omega_max": 3.999048061668873,
+    "clean_path": true,
+    "ros_domain_id": 42,
+    "ground_truth_port": 19870,
+    "result": "PASS"
+  }
+]

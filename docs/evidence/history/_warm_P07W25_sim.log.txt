@@ -1,0 +1,3 @@
+2026-10-13T20:46:08.492156Z  INFO daedalus: [HITSTAT] t=166.5s launches=1698 hits=1648 (97.06%) near=1564 (92.11%)
+2026-10-13T20:46:10.495574Z  INFO daedalus: [HITSTAT] t=168.5s launches=1721 hits=1671 (97.09%) near=1585 (92.10%)
+2026-10-13T20:46:12.491810Z  INFO daedalus: [HITSTAT] t=170.5s launches=1745 hits=1696 (97.19%) near=1607 (92.09%)

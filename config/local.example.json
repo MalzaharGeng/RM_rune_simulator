@@ -1,0 +1,6 @@
+{
+  "GT_UDP_TARGET": "127.0.0.1:9870",
+  "SPIN_MODE": "slow",
+  "SPIN_SLOW_OMEGA": "7.5",
+  "ROS_DOMAIN_ID": "25"
+}

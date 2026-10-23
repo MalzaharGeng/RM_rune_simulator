@@ -1,0 +1,2806 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,18 +2,21 @@
+ mod handler;
+ mod robomaster;
+ mod ros2;
++mod shotlog;
++mod spin;
+ mod statistic;
+ mod util;
+ 
+ use crate::dataset::prelude::DatasetPlugin;
+-use crate::ros2::plugin::{AutoAimBridge, ROS2Plugin, bevy_rotation_from_ros};
++use crate::ros2::plugin::{AutoAimBridge, ROS2Plugin, bevy_rotation_from_ros, mesh_world_centroid};
+ use crate::util::bevy::insert_all_child;
+ use crate::{
+     handler::{on_activate, on_hit},
+     robomaster::power_rune::{PowerRunePlugin, PowerRuneRoot, Projectile},
+     statistic::{
+-        accurate_count, accurate_pct, increase_infantry_hit, increase_launch, infantry_hit_count,
+-        infantry_hit_pct, launch_count,
++        accurate_count, accurate_pct, increase_infantry_hit, increase_infantry_near_hit,
++        increase_launch, infantry_hit_count, infantry_hit_pct, infantry_near_hit_count,
++        infantry_near_hit_pct, launch_count,
+     },
+ };
+ use avian3d::prelude::*;
+@@ -31,6 +34,7 @@
+ };
+ use std::collections::{HashMap, HashSet, VecDeque};
+ use bevy::camera::visibility::RenderLayers;
++use bevy::mesh::VertexAttributeValues;
+ 
+ #[derive(Component)]
+ struct MainCamera {
+@@ -86,12 +90,14 @@
+ /// Creates help text at the bottom of the screen.
+ fn create_help_text() -> Text {
+     format!(
+-        "total={} accurate={} pct={} infantry_hits={} infantry_pct={}\nControls: F2-Screenshot F3-Change Camera | WASD-Move Mouse-Look Space-Shoot\n2025 Actor&Thinker",
++        "total={} accurate={} pct={} infantry_hits={} infantry_pct={}\ninfantry_near={} infantry_near_pct={}  (near-side plate only = honest metric)\nControls: F2-Screenshot F3-Change Camera | WASD-Move Mouse-Look Space-Shoot\n2025 Actor&Thinker",
+         launch_count(),
+         accurate_count(),
+         accurate_pct(),
+         infantry_hit_count(),
+-        infantry_hit_pct()
++        infantry_hit_pct(),
++        infantry_near_hit_count(),
++        infantry_near_hit_pct()
+     )
+         .into()
+ }
+@@ -149,7 +155,12 @@
+         .insert_resource(CameraMode(FollowingType::Robot))
+         .insert_resource(Gravity(Vec3::NEG_Y * 9.81))
+         .insert_resource(SubstepCount(10))
+-        .insert_resource(Cooldown(Timer::from_seconds(0.1, TimerMode::Once)))
++        // 开火冷却 = 最小射击间隔。真机 20 发/秒 => 0.05 s；
++        // 仿真原值 0.1 s 只有 10 发/秒，会把开火占空比人为砍半，掩盖自瞄侧的开火逻辑。
++        // 对齐真机：0.1 -> 0.05。
++        .insert_resource(Cooldown(Timer::from_seconds(0.05, TimerMode::Once)))
++        // 敌方步兵「变速小陀螺」曲线配置 (可用 SPIN_* 环境变量覆盖)
++        .insert_resource(spin::SpinConfig::from_env())
+         .add_systems(Startup, (setup, setup_projectile))
+         .add_observer(setup_vehicle)
+         .add_observer(setup_collision)
+@@ -160,6 +171,7 @@
+             Update,
+             (
+                 update_help_text,
++                log_hit_stats,
+                 following_controls,
+                 vehicle_controls,
+                 remote_vehicle_controls,
+@@ -168,9 +180,19 @@
+                 apply_auto_aim_gimbal.after(gimbal_controls),
+                 freecam_controls,
+                 update_camera_follow,
+-                enemy_infantry_move,
+                 screenshot_on_f2,
+                 screenshot_saving,
++            ),
++        )
++        // 敌方自转必须排在 TransformSystems::Propagate 之前:
++        //   - 让本帧写入的 Transform 参与本帧的 GlobalTransform 传播 (装甲板位置与曲线同步)
++        //   - capture_rune 约束在 Propagate 之后, 于是它读 SpinState 时本帧曲线已推进
++        //     (否则两者无序, 真值偶尔会读到上一帧的角度 -> 重复帧 + 方位角滞后)
++        .add_systems(
++            PostUpdate,
++            (
++                enemy_infantry_move.before(TransformSystems::Propagate),
++                pin_local_infantry.before(TransformSystems::Propagate),
+             ),
+         )
+         .add_systems(
+@@ -188,8 +210,42 @@
+     HashMap<String, (ColliderConstructorHierarchy, CollisionLayers, Visibility)>,
+ );
+ 
+-fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
++/// 敌方步兵的固定水平位置 (Bevy 世界 XZ 平面)。
++///
++/// 默认放在**我方步兵出生点正前方 4 m**。我方车体初始朝向是 Bevy 的 -Z
++/// (`chassis_data.yaw = 0` -> 单位四元数 -> forward = -Z; 枪口节点
++/// `SHOT_DIRECTION` 也在 -Z 侧), 出生点是 (0, 1, 0), 所以正前方 4 m = (0, -4)。
++///
++/// 可用 `ENEMY_X` / `ENEMY_Z` 覆盖, 便于不重编译就换距离/方位。
++fn enemy_fixed_xz() -> (f32, f32) {
++    let get = |key: &str, default: f32| {
++        std::env::var(key)
++            .ok()
++            .and_then(|s| s.trim().parse::<f32>().ok())
++            .filter(|v| v.is_finite())
++            .unwrap_or(default)
++    };
++    (get("ENEMY_X", 0.0), get("ENEMY_Z", -4.0))
++}
++
++/// 是否把我方步兵的水平位置钉在出生点。默认开 (`PIN_LOCAL_INFANTRY=0` 关)。
++fn pin_local_enabled() -> bool {
++    match std::env::var("PIN_LOCAL_INFANTRY") {
++        Ok(v) => {
++            let v = v.trim();
++            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
++        }
++        Err(_) => true,
++    }
++}
++
++fn setup(
++    mut commands: Commands,
++    asset_server: Res<AssetServer>,
++    spin_cfg: Res<spin::SpinConfig>,
++) {
+     spawn_text(&mut commands);
++    let (enemy_x, enemy_z) = enemy_fixed_xz();
+     commands.spawn((
+         DirectionalLight {
+             color: Color::srgb(0.9, 0.95, 1.0),
+@@ -309,8 +365,10 @@
+         SceneRoot(
+             asset_server.load("embedded://daedalus/assets/vehicle.glb#Scene0"),
+         ),
+-        Transform::from_xyz(6.0, 1.0, 4.0),
++        Transform::from_xyz(enemy_x, 1.0, enemy_z),
+         InfantryRoot,
++        // 变速小陀螺状态: 仅敌方步兵持有, 本地步兵 (带 LocalInfantry) 不参与
++        spin::SpinState::from_config(&spin_cfg),
+     ));
+ 
+     commands.spawn((
+@@ -340,27 +398,120 @@
+ #[derive(Component, Clone)]
+ pub struct EnemyArmor;
+ 
++/// 命中计数。
++///
++/// 记两个数:
++/// - `infantry_hits`: 碰到任意一块敌方装甲板就算 (原有语义, 保持不变)
++/// - `infantry_near`: 额外要求被击中的那块板的**外法线朝向炮口**,
++///   也就是自瞄本来打算打的那一块。这才是可信的指标。
++///
++/// 为什么需要后者: 仿真的命中判定被几何放大了。弹丸的碰撞层是 `ProjectileSelf`,
++/// 而车体圆柱的 filter 不含它 (两边判定是双向与), 所以弹丸**直接穿过车体**;
++/// 装甲板的碰撞体来自 `ColliderConstructorHierarchy`, 取 `CollisionLayers::DEFAULT`,
++/// 与弹丸能相交 —— 于是弹丸穿堂而过时, 入射侧和出射侧都可能撞到板。
++/// 又因为 4 块板间隔精确 90°、板宽 135.7mm + 弹丸 44.5mm 让切向角容差到 ±24.7°,
++/// 「打错一块板 (差 90°)」和「穿堂打到对面板」都照样算命中。
++///
++/// 蒙特卡洛 (tools/hit_prob_model.py) 的结论: yaw 误差完全随机时总命中率仍有
++/// 约 0.79, 而健康估计是 1.00 —— 只差 20 个点, 区分不出好坏。
++/// 只算近侧命中后变成 1.00 vs 约 0.5, 才有区分度。
+ fn count_infantry_hit(
+     event: On<CollisionStart>,
+     projectiles: Query<(), With<Projectile>>,
+-    enemy_armors: Query<(), With<EnemyArmor>>,
++    enemy_armors: Query<(&GlobalTransform, &Mesh3d), With<EnemyArmor>>,
++    armor_meshes: Res<Assets<Mesh>>,
++    enemy_center: Query<&GlobalTransform, (With<InfantryRoot>, Without<LocalInfantry>)>,
++    gimbal: Query<&GlobalTransform, (With<LocalInfantry>, With<InfantryGimbal>)>,
++    shot_ids: Query<&shotlog::ShotId>,
++    armor_names: Query<&Armor>,
++    shotlog: Res<shotlog::ShotLog>,
+     mut scored_projectiles: Local<HashSet<Entity>>,
+ ) {
+     let projectile = if projectiles.contains(event.collider1)
+         && enemy_armors.contains(event.collider2)
+     {
+-        Some(event.collider1)
++        Some((event.collider1, event.collider2))
+     } else if projectiles.contains(event.collider2) && enemy_armors.contains(event.collider1) {
+-        Some(event.collider2)
++        Some((event.collider2, event.collider1))
+     } else {
+         None
+     };
+ 
+-    if let Some(projectile) = projectile {
+-        if scored_projectiles.insert(projectile) {
+-            increase_infantry_hit();
++    let Some((projectile, armor)) = projectile else {
++        return;
++    };
++    if !scored_projectiles.insert(projectile) {
++        return;
++    }
++    increase_infantry_hit();
++
++    // 近侧判定: 板心相对车体中心的方向就是板的外法线; 它朝向云台 => 自瞄瞄的就是这块。
++    // 板心必须走 mesh 顶点质心, 节点原点是退化的 (见 plugin.rs::mesh_world_centroid)。
++    let mut near = false;
++    let plate_name = armor_names
++        .get(armor)
++        .map(|a| a.0.clone())
++        .unwrap_or_else(|_| "?".to_string());
++    if let Ok((armor_gt, armor_mesh)) = enemy_armors.get(armor) {
++        if let (Some(center_gt), Some(gimbal_gt)) =
++            (enemy_center.iter().next(), gimbal.iter().next())
++        {
++            if let Some(plate) = armor_meshes
++                .get(armor_mesh)
++                .and_then(|m| mesh_world_centroid(armor_gt, m))
++            {
++                let outward = (plate - center_gt.translation()).normalize_or_zero();
++                let to_gimbal = (gimbal_gt.translation() - plate).normalize_or_zero();
++                if outward.dot(to_gimbal) > 0.0 {
++                    near = true;
++                    increase_infantry_near_hit();
++                }
++            }
+         }
+     }
++
++    // 逐发埋点: 记录这一发命中了哪块板 / 是否近侧。
++    if let Ok(sid) = shot_ids.get(projectile) {
++        shotlog.on_hit(sid.0, &plate_name, near);
++    }
++}
++
++/// 装甲板内倾角 (度)。
++///
++/// 真车的装甲板不是竖直的: 板顶向车体中心倒 (内倾)。自瞄 `solver.cpp::reproject_armor`
++/// 也是按 15 度内倾建模的 —— 它的装甲板局部系 +X 是**内法线** (指向车体中心),
++/// 这点由 target.cpp 的量测模型确定 (`z[3] = ypr_in_world[0]` 直接与
++/// `h(x)[3] = x[6] + id*90deg` 比较, 而 `h_armor_xyz` 给出
++/// `armor_xy = center_xy - r*(cos a, sin a)`, 即 a 是从板指向车体中心的方位角)。
++///
++/// 仿真里原来的板是竖直的 (pitch = 0), 与真车不一致, 于是测试台低估了自瞄的模型误差。
++/// 本项把它改成内倾。用 `ARMOR_TILT_DEG` 覆盖, 设 0 可完全关闭 (恢复竖直)。
++fn armor_tilt_deg() -> f32 {
++    std::env::var("ARMOR_TILT_DEG")
++        .ok()
++        .and_then(|s| s.trim().parse::<f32>().ok())
++        .filter(|v| v.is_finite())
++        .unwrap_or(15.0)
++}
++
++/// 仿真装甲板 `_P` 代理面的目标尺寸 (宽 = 水平, 高 = 竖直), 单位 m。
++///
++/// 取值来自 `vehicle.glb` 里**真正渲染出来的灯条网格** `ARMOR_n_L` 的包围盒
++/// (外缘间距 0.13780 m, 灯条长 0.05984 m) —— 那才是车模 CAD 的真实尺寸。
++/// 而 `ARMOR_n_P` 只有 0.13571 x 0.0500 / 0.0518 m, 比它矮 16%,
++/// 却承担着碰撞体 / `[SIM_GT]` / 数据集标注 ⇒ 属于资产内部不一致, 这里归一到灯条尺寸。
++///
++/// 自瞄 `solver.cpp` 的 PnP 模型是 135.7 x 56 mm, 所以归一后仿真板会**略大于**
++/// 自瞄模型 (水平 +1.5%, 竖直 +6.9%)。用 `ARMOR_PLATE_W` / `ARMOR_PLATE_H` 覆盖。
++fn armor_plate_size() -> (f32, f32) {
++    let read = |key: &str, default: f32| {
++        std::env::var(key)
++            .ok()
++            .and_then(|s| s.trim().parse::<f32>().ok())
++            .filter(|v| v.is_finite() && *v > 0.0)
++            .unwrap_or(default)
++    };
++    (read("ARMOR_PLATE_W", 0.13780), read("ARMOR_PLATE_H", 0.05984))
+ }
+ 
+ fn setup_vehicle(
+@@ -370,9 +521,10 @@
+     root_query: Query<(Entity, Option<&LocalInfantry>), With<InfantryRoot>>,
+     secondary_query: Query<&ChildOf, (Without<InfantryRoot>, Without<SceneInstance>)>,
+     node_query: Query<
+-        (Entity, &Name, &ChildOf, &Transform),
++        (Entity, &Name, &ChildOf, &Transform, Option<&Mesh3d>),
+         (Without<InfantryRoot>, Without<SceneInstance>),
+     >,
++    armor_meshes: Res<Assets<Mesh>>,
+ ) {
+     let root = events.entity;
+     if root_query.get(root).is_err() {
+@@ -382,7 +534,7 @@
+ 
+     let mut despawn = HashSet::new();
+ 
+-    for (node, name, &ChildOf(secondary), transform) in node_query {
++    for (node, name, &ChildOf(secondary), transform, _mesh) in node_query {
+         let Ok(&ChildOf(root2)) = secondary_query.get(secondary) else {
+             continue;
+         };
+@@ -401,6 +553,9 @@
+                 ent.insert(InfantryChassis::default());
+                 let mut stack = VecDeque::from([(node, name)]);
+                 let mut set = HashSet::new();
++                let mut tilted: Vec<String> = Vec::new();
++                let mut sized: Vec<String> = Vec::new();
++                let mut am_tilt: Vec<(Entity, Vec3, Quat)> = Vec::new();
+                 while let Some((e, name)) = stack.pop_front() {
+                     if !set.insert(e) {
+                         continue;
+@@ -415,12 +570,177 @@
+                                 TrimeshFlags::MERGE_DUPLICATE_VERTICES,
+                             ),
+                         ));
++
++                        // 板顶向车体中心内倾 + 把板面尺寸归一到真实装甲板。
++                        //
++                        // ⚠️ 两个坑:
++                        //  (1) 板几何烘在网格里 (ARMOR_n_P 相对 BASE 的合成变换是单位矩阵),
++                        //      所以必须绕**板心**做变换, 不能直接改 rotation / scale
++                        //      (那会绕节点原点 = 车体中心甩出去)。
++                        //  (2) Bevy 0.17 把 glb 节点的 mesh 放在**子实体**上, ARMOR_n_P 自己
++                        //      没有 Mesh3d, 所以板心与现有尺寸要遍历整棵子树、把所有 mesh 顶点求出来。
++                        //
++                        // 内倾施加在**父节点 AM_n** 上 (而不是只转 _P), 这样灯条 ARMOR_n_L、
++                        // 编号 ARMOR_n_3_C、模块 ARMOR_n 会跟着一起内倾 —— 否则画面里板是竖直的、
++                        // 真值却是 15 度内倾的, 两者对不上。
++                        // AM 局部系里: 板心 C = t_p + c (c = 网格顶点质心, 网格坐标即 BASE 坐标),
++                        // 绕 C 转 R 得  AM' = T(C) * R * T(-C) * AM
++                        //   =>  t_am' = C + R*(t_am - C),  R' = R
++                        // _P 自己只做"绕板心缩放": t_p' = t_p + c - S∘c, R = I, S = 各轴缩放。
++                        //
++                        // 尺寸: GLB 里 ARMOR_n_P 只有 135.71 x 50.0 / 51.8 mm, 比实际渲染出来的
++                        // 灯条 (ARMOR_n_L, 137.80 x 59.84 mm) 矮 16% —— 而碰撞体、[SIM_GT]
++                        // 与数据集标注都取这个 _P 面。这里把它归一到灯条外缘矩形, 让仿真自己的
++                        // 真值与画面一致。自瞄模型是 135.7 x 56 mm, 故仿真板会略大于自瞄模型。
++                        let (target_w, target_h) = armor_plate_size();
++                        {
++                            let mut sum = Vec3::ZERO;
++                            let mut count = 0usize;
++                            let mut min_v = Vec3::splat(f32::INFINITY);
++                            let mut max_v = Vec3::splat(f32::NEG_INFINITY);
++                            let mut stack2: VecDeque<Entity> = VecDeque::new();
++                            stack2.push_back(e);
++                            let mut seen2: HashSet<Entity> = HashSet::new();
++                            while let Some(x) = stack2.pop_front() {
++                                if !seen2.insert(x) {
++                                    continue;
++                                }
++                                if let Ok((_, _, _, _, Some(m))) = node_query.get(x) {
++                                    if let Some(mesh) = armor_meshes.get(&m.0) {
++                                        for (_a, values) in mesh.attributes() {
++                                            if let VertexAttributeValues::Float32x3(v) = values {
++                                                for &p in v {
++                                                    let p = Vec3::from(p);
++                                                    sum += p;
++                                                    min_v = min_v.min(p);
++                                                    max_v = max_v.max(p);
++                                                    count += 1;
++                                                }
++                                                break;
++                                            }
++                                        }
++                                    }
++                                }
++                                if let Ok(ch) = children.get(x) {
++                                    for c in ch.iter() {
++                                        stack2.push_back(c);
++                                    }
++                                }
++                            }
++
++                            if count == 0 {
++                                bevy::log::warn!("[ARMOR_SIZE] {} no mesh vertices", name);
++                            } else if let Ok((
++                                _,
++                                _,
++                                &ChildOf(am),
++                                &Transform { translation: t_p, .. },
++                                _,
++                            )) = node_query.get(e)
++                            {
++                                let c = sum / count as f32;
++                                let ext = max_v - min_v;
++                                // 最薄的一维是板厚 (不缩放); 竖直恒为 Y; 剩下一维是水平
++                                let mut thin = 0usize;
++                                if ext[1] < ext[thin] {
++                                    thin = 1;
++                                }
++                                if ext[2] < ext[thin] {
++                                    thin = 2;
++                                }
++                                let horiz = if thin == 0 {
++                                    Some(2usize)
++                                } else if thin == 2 {
++                                    Some(0usize)
++                                } else {
++                                    None
++                                };
++                                let mut s = Vec3::ONE;
++                                if let Some(h) = horiz {
++                                    if ext[h] > 1e-6 {
++                                        s[h] = target_w / ext[h];
++                                    }
++                                }
++                                if thin != 1 && ext[1] > 1e-6 {
++                                    s[1] = target_h / ext[1];
++                                }
++
++                                // (a) _P 代理面: 只绕板心缩放, 不旋转 (旋转交给父节点)
++                                commands.entity(e).insert(Transform {
++                                    translation: t_p + c - s * c,
++                                    rotation: Quat::IDENTITY,
++                                    scale: s,
++                                });
++
++                                // (b) 父节点 AM_n: 绕板心内倾 (板法线方向朝车体中心)
++                                let tilt = armor_tilt_deg();
++                                let outward = Vec3::new(c.x, 0.0, c.z).normalize_or_zero();
++                                let rot = if tilt.abs() > 1e-6 && outward.length_squared() > 0.5 {
++                                    tilted.push(name.to_string());
++                                    Quat::from_axis_angle(outward.cross(Vec3::Y), tilt.to_radians())
++                                } else {
++                                    if tilt.abs() > 1e-6 {
++                                        bevy::log::warn!("[ARMOR_TILT] {} outward degenerate", name);
++                                    }
++                                    Quat::IDENTITY
++                                };
++                                if let Ok((_, _, _, &Transform { translation: t_am, .. }, _)) =
++                                    node_query.get(am)
++                                {
++                                    // 内倾支点必须用 **BASE 系** 的真实板心, 而不是 AM 局部系。
++                                    //
++                                    // 世界位置: world(v) = t_am + t_p + v (v = mesh 顶点原始坐标)。
++                                    //   - AM_1 / AM_2: t_am = 0, t_p = 0  => BASE 系板心 = c, 与旧写法等价。
++                                    //   - AM_3 / AM_4: t_am != 0, 且 t_p = -t_am (资产用来抵消父平移)
++                                    //                  => BASE 系板心 = t_am + t_p + c = c。
++                                    //   旧写法 c_local = t_p + c = c - t_am 会把支点甩到车体中心附近,
++                                    //   导致 AM_3/AM_4 绕车心转 15°、板心竖直错位约 57mm (2026-10-13 查实的 BUG)。
++                                    let c_world = t_am + t_p + c;
++                                    am_tilt.push((am, c_world + rot * (t_am - c_world), rot));
++                                }
++
++                                if let Some(h) = horiz {
++                                    sized.push(format!(
++                                        "{} {:.2}x{:.2} -> {:.1}x{:.1}mm",
++                                        name,
++                                        ext[h] * 1000.0,
++                                        ext[1] * 1000.0,
++                                        ext[h] * s[h] * 1000.0,
++                                        ext[1] * s[1] * 1000.0
++                                    ));
++                                }
++                            }
++                        }
+                     }
+-                    for (ee, n, &ChildOf(r), _) in node_query {
++                    for (ee, n, &ChildOf(r), _, _) in node_query {
+                         if r == e {
+                             stack.push_back((ee, n));
+                         }
+                     }
++                }
++                // 内倾统一在父节点 AM_n 上落一次 (每个 AM 只有一个 _P 子节点)
++                for (am, t, rot) in am_tilt {
++                    commands.entity(am).insert(Transform {
++                        translation: t,
++                        rotation: rot,
++                        scale: Vec3::ONE,
++                    });
++                }
++                if !tilted.is_empty() {
++                    bevy::log::info!(
++                        "[ARMOR_TILT] {:.1} deg inward tilt applied to {} whole assembly(AM_n): {}",
++                        armor_tilt_deg(),
++                        tilted.len(),
++                        tilted.join(", ")
++                    );
++                }
++                if !sized.is_empty() {
++                    bevy::log::info!(
++                        "[ARMOR_SIZE] _P proxy resized to {:.2} x {:.2} mm: {}",
++                        armor_plate_size().0 * 1000.0,
++                        armor_plate_size().1 * 1000.0,
++                        sized.join(", ")
++                    );
+                 }
+             }
+             "GIMBAL" => {
+@@ -481,6 +801,7 @@
+         (With<LocalInfantry>, Without<InfantryChassis>),
+     >,
+     launch_offset: Single<&InfantryLaunchOffset, With<LocalInfantry>>,
++    shotlog: Res<shotlog::ShotLog>,
+ ) {
+     cooldown.0.tick(time.delta());
+     if !cooldown.0.is_finished() {
+@@ -494,46 +815,59 @@
+         if direction == Vec3::ZERO {
+             return;
+         }
++        // 逐发埋点: 记离膛时刻与"距最近一次 fire 请求"的延迟。
++        // 姿态对比留给 9871 遥测(plan_yaw vs gimbal_yaw_state), 这里不重复记。
++        let dist = auto_aim
++            .latest_command()
++            .map(|c| c.distance)
++            .unwrap_or(f32::NAN);
++        let shot_id = shotlog.on_launch(dist);
+         let vel = infantry.1.0 + direction * 25.0;
+-        commands.spawn((
+-            RigidBody::Dynamic,
+-            Collider::sphere(44.5 * 0.001 / 2.0),
+-            Mass(44.5 * 0.001),
+-            Friction::new(1.1),
+-            Restitution::ZERO,
+-            LinearDamping(0.05),
+-            CollisionLayers::new(
+-                GameLayer::ProjectileSelf,
+-                [
+-                    GameLayer::Default,
+-                    GameLayer::Vehicle,
++        // ⚠️ Bevy 的 Bundle 元组最多 16 个元素; 原 16 个已满, 所以 shot_id 用 .insert 追加。
++        commands
++            .spawn((
++                RigidBody::Dynamic,
++                Collider::sphere(44.5 * 0.001 / 2.0),
++                Mass(44.5 * 0.001),
++                Friction::new(1.1),
++                Restitution::ZERO,
++                LinearDamping(0.05),
++                CollisionLayers::new(
+                     GameLayer::ProjectileSelf,
+-                    GameLayer::ProjectileOther,
+-                    GameLayer::Environment,
+-                ],
+-            ),
+-            Mesh3d(setting.0.clone()),
+-            MeshMaterial3d(setting.1.clone()),
+-            LinearVelocity(vel),
+-            AngularVelocity(infantry.2.0),
+-            Transform::IDENTITY.with_translation(
+-                infantry.0.translation + (gimbal.0.rotation() * launch_offset.0.translation),
+-            ),
+-            //AudioPlayer::new(asset_server.load("projectile_launch.ogg")),
+-            Projectile,
+-            RenderLayers::layer(1),
+-            ProjectileLifetime(Timer::from_seconds(PROJECTILE_LIFETIME_SECS, TimerMode::Once)),
+-        ));
++                    [
++                        GameLayer::Default,
++                        GameLayer::Vehicle,
++                        GameLayer::ProjectileSelf,
++                        GameLayer::ProjectileOther,
++                        GameLayer::Environment,
++                    ],
++                ),
++                Mesh3d(setting.0.clone()),
++                MeshMaterial3d(setting.1.clone()),
++                LinearVelocity(vel),
++                AngularVelocity(infantry.2.0),
++                Transform::IDENTITY.with_translation(
++                    infantry.0.translation + (gimbal.0.rotation() * launch_offset.0.translation),
++                ),
++                //AudioPlayer::new(asset_server.load("projectile_launch.ogg")),
++                Projectile,
++                RenderLayers::layer(1),
++                ProjectileLifetime(Timer::from_seconds(PROJECTILE_LIFETIME_SECS, TimerMode::Once)),
++            ))
++            .insert(shot_id);
+     }
+ }
+ 
+ fn projectile_cleanup(
+     time: Res<Time>,
+     mut commands: Commands,
+-    mut projectiles: Query<(Entity, &mut ProjectileLifetime), With<Projectile>>,
+-) {
+-    for (entity, mut lifetime) in &mut projectiles {
++    mut projectiles: Query<(Entity, &mut ProjectileLifetime, &shotlog::ShotId), With<Projectile>>,
++    shotlog: Res<shotlog::ShotLog>,
++) {
++    for (entity, mut lifetime, shot_id) in &mut projectiles {
+         if lifetime.0.tick(time.delta()).just_finished() {
++            // 寿命耗尽仍未命中 => 漏弹。
++            shotlog.on_miss(shot_id.0);
+             commands.entity(entity).despawn();
+         }
+     }
+@@ -574,11 +908,23 @@
+ const VEHICLE_ACCEL: f32 = 10.0;
+ // 单位 rad/s
+ const VEHICLE_ROTATION_SPEED: f32 = 3.0;
+-const GIMBAL_ROTATION_SPEED: f32 = 3.0;
++// 云台转速上限。真机云台实际约 6~8 rad/s。
++// 原值 3.0 时，小陀螺换板阶跃（实测中位 0.114 rad）单拍追不上，
++// |plan_yaw - gimbal_yaw| 长期超 fire_thresh，导致近距离开火占空比只有 ~3%。
++// 6.0 rad/s @60fps => 单拍 0.10 rad，可基本一拍吃下换板阶跃。
++const GIMBAL_ROTATION_SPEED: f32 = 6.0;
+ 
+ const MAX_VEHICLE_VELOCITY: f32 = 6.0;
+-// 弹丸存活时长，单位 s（远大于 45° 最大滞空 3.61s）
+-const PROJECTILE_LIFETIME_SECS: f32 = 10.0;
++// 弹丸存活时长，单位 s。
++//
++// ⚠️ 2026-10-12 从 10.0 降到 2.0。原注释说「远大于 45° 最大滞空 3.61s」，
++// 但那是按"弹丸少"的前提写的。删掉仿真入口那道多余的开火门之后，自瞄开火占空比
++// 从 2% 升到 ~52%，配合 20 发/秒 => 场上同时存在 20 × 10 = 200 个动态刚体，
++// 而弹丸的碰撞层含 ProjectileSelf 自碰撞（碰撞对 O(n²)）⇒ 实测仿真帧率
++// 从 ~85 Hz 崩到 ~20 Hz（见 _pj_analysis/fps_analyze.py 的帧率曲线），
++// 自瞄图像流断续、tracker 反复 "Large dt ... reset target"，重投影严重乱飘。
++// 2.0 s @ 25 m/s = 50 m 射程，平射场景（敌人 4 m）绰绰有余，弹丸数降到 ~40。
++const PROJECTILE_LIFETIME_SECS: f32 = 2.0;
+ 
+ fn vehicle_controls(
+     time: Res<Time>,
+@@ -850,22 +1196,132 @@
+     }
+ }
+ 
++/// 敌方步兵「变速小陀螺」。
++///
++/// 与原实现相比:
++/// - **取消水平方向移动**: 不再做正弦往返, 而是把 x/z 钉在 [`enemy_fixed_xz`]
++///   给出的固定点 (默认 = 我方出生点正前方 4 m, 即 (0, -4)),
++///   使敌方原地固定 (y 仍由物理/重力决定, 保证正常贴地)。钉住位置也可避免被弹丸冲量顶走。
++/// - **改为变速旋转**: 转角由 [`spin::SpinState`] 累计推进 (固定角加速度 + 变速区间),
++///   不再是恒定的 `3.0 * t`。累计转角连续不重置, 保证姿态无跳变。
++///
++/// 时间用仿真时间 (`Time`), 暂停时曲线同步停止。
++///
++/// **注意**: 敌方车体是 avian3d `RigidBody::Dynamic`, 姿态由物理回写 (`Rotation` -> `Transform`)。
++/// 只写 `Transform.rotation` 时, 物理回写会用上一固定步采样的 `Rotation` 覆盖它, 导致
++/// 车体实际朝向比 `SpinState.angle` 滞后最多一个固定步 (64 Hz -> 15.6 ms, 18 rad/s 时约 10°),
++/// 装甲板真值随之抖动。因此这里同时写 avian3d 的 `Rotation`, 让回写结果与曲线完全一致。
+ fn enemy_infantry_move(
+     time: Res<Time>,
+-    mut enemy: Query<&mut Transform, (With<InfantryRoot>, Without<LocalInfantry>)>,
+-) {
+-    // 横向直线往返: 沿垂直于视线 (0,0)->(7,4) 的方向, 单位向量 (-4,7)/√65
+-    // 振幅 1.5m, 角频率 0.4rad/s -> 最大速度 0.6m/s (与原圆周切向速度一致)
+-    let t = time.elapsed_secs();
+-    let perp = Vec2::new(-4.0, 7.0) / 65.0f32.sqrt();
+-    let offset = 1.5 * (0.4 * t).sin();
+-    // 小陀螺: 车体绕 Y 轴自转 3.0rad/s (约 0.48 转/秒), 装甲板随之旋转
+-    let spin = Quat::from_rotation_y(3.0 * t);
+-    for mut transform in enemy.iter_mut() {
+-        transform.translation.x = 7.0 + perp.x * offset;
+-        transform.translation.z = 4.0 + perp.y * offset;
+-        transform.rotation = spin;
+-    }
++    spin_cfg: Res<spin::SpinConfig>,
++    mut enemy: Query<
++        (&mut Transform, &mut Rotation, &mut spin::SpinState),
++        (With<InfantryRoot>, Without<LocalInfantry>),
++    >,
++) {
++    let (fixed_x, fixed_z) = enemy_fixed_xz();
++
++    let dt = time.delta_secs() as f64;
++    let sim_t = time.elapsed_secs() as f64;
++    for (mut transform, mut phys_rot, mut state) in enemy.iter_mut() {
++        // 固定在原地: 只钉水平位置, y 交给物理 (贴地/重力行为不变)
++        transform.translation.x = fixed_x;
++        transform.translation.z = fixed_z;
++
++        spin::advance_spin(&mut state, &spin_cfg, dt, sim_t);
++        // 构造四元数时对 2π 取模: 姿态完全等价, 但可避免长时间运行后 f32 精度退化
++        // (state.angle 本身保持连续累计, 真值输出的仍是完整转角)。
++        // Bevy 绕 +Y 旋转 <-> ROS 系绕 +Z 的 yaw, 二者同号 (见 ros2::plugin::M_ALIGN_MAT3)
++        let render_angle = state.angle.rem_euclid(std::f64::consts::TAU);
++        let q = Quat::from_rotation_y(render_angle as f32);
++        transform.rotation = q;
++        // 同步写物理姿态, 否则物理回写会用滞后一个固定步的旧值覆盖上面的 Transform
++        phys_rot.0 = q;
++    }
++}
++
++/// 把我方步兵的水平位置钉在出生点 (Bevy (0, 0)), **直到用户第一次给出车体移动输入**。
++///
++/// 为什么需要: 我方车体是 `RigidBody::Dynamic` 且 `LinearDamping(0.0)`, 出生点 (0, 1, 0)
++/// 又和 POWER 符 (原点) 重合。符是 `RigidBody::Static` 而且会转, 实测落地后车体会被挤出去、
++/// 顺着地形滑走 —— 在一台跑了几十分钟的实例上量到它停在离出生点 **5.4 m** 的地方
++/// (`/tf` 的 gimbal_link 在 odom_vision 下是 (-2.451, -4.791), 换算回 Bevy 是 (4.79, 2.45))。
++/// 那样「敌方放在我方出生点前方 4 m」就不可复现 —— 实际距离会缩到 2.6 m 左右。
++///
++/// **只要用户在跟随视角下按下 W/A/S/D/Q/E 里任意一个, 钉住就永久解除**, 之后完全自由驾驶
++/// (想重新钉住只能重启仿真)。这样开局几何依然确定、可复现, 又不妨碍手动挪车。
++/// 想开局就自由: `PIN_LOCAL_INFANTRY=0`。
++///
++/// 注意: `FollowingType::Free` 视角下 W/A/S/D 是移动**自由相机** (见 `free_camera_controls`),
++/// 不是开车, 所以那种情况下不解除。
++///
++/// 只钉水平位置, y 仍交给物理 (贴地/重力行为不变), 与 `enemy_infantry_move` 同机制。
++fn pin_local_infantry(
++    mut cached: Local<Option<bool>>,
++    mut released: Local<bool>,
++    mode: Res<CameraMode>,
++    keyboard: Res<ButtonInput<KeyCode>>,
++    mut ours: Query<
++        (&mut Transform, &mut Position, &mut LinearVelocity),
++        (With<InfantryRoot>, With<LocalInfantry>),
++    >,
++) {
++    if !*cached.get_or_insert_with(pin_local_enabled) {
++        return;
++    }
++    if *released {
++        return;
++    }
++    if mode.0 != FollowingType::Free {
++        const MOVE_KEYS: [KeyCode; 6] = [
++            KeyCode::KeyW,
++            KeyCode::KeyS,
++            KeyCode::KeyA,
++            KeyCode::KeyD,
++            KeyCode::KeyQ,
++            KeyCode::KeyE,
++        ];
++        if MOVE_KEYS.iter().any(|k| keyboard.pressed(*k)) {
++            *released = true;
++            bevy::log::info!(
++                "[PIN] local infantry released by WASD/QE -> free driving enabled"
++            );
++            return;
++        }
++    }
++    for (mut transform, mut position, mut velocity) in ours.iter_mut() {
++        transform.translation.x = 0.0;
++        transform.translation.z = 0.0;
++        // 同时钉物理位置与水平速度: 车体 `LinearDamping(0.0)`, 没有任何阻力,
++        // 只钉 Transform 会被物理回写 (Position -> Transform) 覆盖, 照样滑走。
++        position.0.x = 0.0;
++        position.0.z = 0.0;
++        velocity.0.x = 0.0;
++        velocity.0.z = 0.0;
++    }
++}
++
++/// 周期性把命中统计写进日志 (每 2 s 一条 `[HITSTAT]`)。
++///
++/// 仿真的 HUD 画在窗口里, 后台/无头运行时看不到, 也没法截图。
++/// 这个日志把 HUD 上的四个数原样落到 stdout, 脚本就能直接判读命中率:
++/// `hits` = 碰到任意一块敌方装甲板, `near` = 额外要求该板外法线朝向炮口
++/// (自瞄本来打算打的那一块, 才是可信指标 —— 见 `statistic.rs` 的说明)。
++fn log_hit_stats(mut last: Local<f32>, time: Res<Time>) {
++    let now = time.elapsed_secs();
++    if now - *last < 2.0 {
++        return;
++    }
++    *last = now;
++    bevy::log::info!(
++        "[HITSTAT] t={:.1}s launches={} hits={} ({:.2}%) near={} ({:.2}%)",
++        now,
++        statistic::launch_count(),
++        statistic::infantry_hit_count(),
++        100.0 * statistic::infantry_hit_pct(),
++        statistic::infantry_near_hit_count(),
++        100.0 * statistic::infantry_near_hit_pct(),
++    );
+ }
+ 
+ fn freecam_controls(
+--- a/src/shotlog.rs
++++ b/src/shotlog.rs
+@@ -0,0 +1,177 @@
++//! 逐发事件埋点（只读诊断，不影响任何物理逻辑）。
++//!
++//! 目的：把「自瞄 fire 请求 → 仿真实际离膛 → 命中哪块板」这条事件链
++//! 逐发记录下来，用于与 GT 板位序列对齐，定量测量：
++//!
++//! * `req_to_launch_ms` —— 从"最近一次 fire 请求到达"到"实际离膛"的延迟。
++//!   这是本模块存在的主要理由：`main.rs::projectile_launch` 里 cooldown
++//!   是一个自由运行的 50 ms 定时器，只在它到点的那一帧才检查 fire 请求，
++//!   所以离膛时刻相对请求时刻存在 [0, 50ms) 的量化抖动（期望 25 ms）。
++//!   在 7.5 rad/s 小陀螺下 25 ms 折合 10.7°。
++//! * 离膛时刻云台的实际 yaw/pitch —— 与自瞄 `plan.target_yaw/pitch` 对比。
++//! * 命中板名 + 是否近侧 + 命中时刻 —— 与 GT 板位对齐后可算真实脱靶量。
++//!
++//! 输出：环境变量 `SHOT_LOG` 指定的路径，每行一个 JSON 对象（JSONL）。
++//! 不设该变量时整个模块短路，默认构建行为与改动前完全一致。
++//!
++//! ⚠️ 只记录，不改变任何决策。没有"命中即销毁"，弹丸寿命不变。
++//!
++//! 时钟：内部自建单调时钟（进程内 `Instant` 基准），因为 fire 请求来自
++//! ROS2 异步线程、离膛/命中来自 Bevy 主循环，两者必须共用同一时间轴。
++
++use std::collections::HashMap;
++use std::fs::OpenOptions;
++use std::io::Write;
++use std::sync::{Arc, Mutex};
++use std::time::Instant;
++
++use bevy::prelude::*;
++
++/// 弹丸实体上挂的自增编号，用来把离膛事件和命中事件关联起来。
++#[derive(Component, Clone, Copy, Debug)]
++pub struct ShotId(pub u32);
++
++#[derive(Debug, Clone, Copy)]
++struct PendingLaunch {
++    req_to_launch_ms: f32,
++}
++
++#[derive(Debug)]
++struct ShotLogState {
++    epoch: Instant,
++    file: Option<std::fs::File>,
++    next_id: u32,
++    /// 最近一次自瞄 fire 请求：到达时刻 + 该请求的 yaw/pitch。
++    last_fire_req: Option<(f64, f32, f32)>,
++    /// shot_id -> 离膛信息，命中/漏弹时取用。
++    pending: HashMap<u32, PendingLaunch>,
++}
++
++/// 可跨线程克隆的句柄（ROS2 异步线程 + Bevy 主循环共用）。
++#[derive(Resource, Clone, Default)]
++pub struct ShotLog(pub Arc<Mutex<ShotLogState>>);
++
++impl Default for ShotLogState {
++    fn default() -> Self {
++        Self {
++            epoch: Instant::now(),
++            file: None,
++            next_id: 1,
++            last_fire_req: None,
++            pending: HashMap::new(),
++        }
++    }
++}
++
++impl ShotLog {
++    /// 读 `SHOT_LOG` 环境变量并打开输出文件。未设置则整体短路。
++    pub fn from_env() -> Self {
++        let path = std::env::var("SHOT_LOG").ok().filter(|s| !s.trim().is_empty());
++        let file = path.and_then(|p| match OpenOptions::new().create(true).append(true).open(&p) {
++            Ok(f) => {
++                bevy::log::info!("[SHOTLOG] per-shot events -> {p}");
++                Some(f)
++            }
++            Err(e) => {
++                bevy::log::warn!("[SHOTLOG] cannot open {p}: {e}; disabled");
++                None
++            }
++        });
++        Self(Arc::new(Mutex::new(ShotLogState {
++            epoch: Instant::now(),
++            file,
++            ..Default::default()
++        })))
++    }
++
++    fn enabled(&self) -> bool {
++        self.0.lock().map(|s| s.file.is_some()).unwrap_or(false)
++    }
++
++    /// 自瞄 fire 请求到达（ROS2 线程调用）。epoch = 进程启动 Instant。
++    pub fn on_fire_request(&self, yaw: f32, pitch: f32, distance: f32) {
++        if !self.enabled() {
++            return;
++        }
++        let mut st = match self.0.lock() {
++            Ok(s) => s,
++            Err(_) => return,
++        };
++        let t = st.epoch.elapsed().as_secs_f64();
++        st.last_fire_req = Some((t, yaw, pitch));
++        if let Some(f) = &mut st.file {
++            let _ = writeln!(
++                f,
++                r#"{{"ev":"req","t":{t:.6},"yaw":{yaw:.6},"pitch":{pitch:.6},"dist":{distance:.4}}}"#
++            );
++        }
++    }
++
++    /// 实际离膛。返回分配给该发弹丸的 `ShotId`。
++    pub fn on_launch(&self, dist: f32) -> ShotId {
++        let mut st = match self.0.lock() {
++            Ok(s) => s,
++            Err(_) => return ShotId(0),
++        };
++        let id = st.next_id;
++        st.next_id += 1;
++        if st.file.is_none() {
++            return ShotId(id);
++        }
++        let t = st.epoch.elapsed().as_secs_f64();
++        let (req_ms, req_yaw, req_pitch) = match st.last_fire_req.take() {
++            Some((rt, ry, rp)) => (((t - rt) * 1000.0) as f32, ry, rp),
++            None => (f32::NAN, f32::NAN, f32::NAN),
++        };
++        st.pending.insert(id, PendingLaunch { req_to_launch_ms: req_ms });
++        if let Some(f) = &mut st.file {
++            let _ = writeln!(
++                f,
++                r#"{{"ev":"launch","t":{t:.6},"shot_id":{id},"req_to_launch_ms":{req_ms:.2},"req_yaw":{req_yaw:.6},"req_pitch":{req_pitch:.6},"dist":{dist:.4}}}"#
++            );
++        }
++        ShotId(id)
++    }
++
++    /// 命中（含近侧标记）。
++    pub fn on_hit(&self, id: u32, plate: &str, near: bool) {
++        if !self.enabled() {
++            return;
++        }
++        let mut st = match self.0.lock() {
++            Ok(s) => s,
++            Err(_) => return,
++        };
++        let t = st.epoch.elapsed().as_secs_f64();
++        let req_ms = st
++            .pending
++            .remove(&id)
++            .map(|p| p.req_to_launch_ms)
++            .unwrap_or(f32::NAN);
++        if let Some(f) = &mut st.file {
++            let near_i = if near { 1 } else { 0 };
++            let _ = writeln!(
++                f,
++                r#"{{"ev":"hit","t":{t:.6},"shot_id":{id},"plate":"{plate}","near":{near_i},"req_to_launch_ms":{req_ms:.2}}}"#
++            );
++        }
++    }
++
++    /// 弹丸寿命结束且从未命中（漏弹）。
++    pub fn on_miss(&self, id: u32) {
++        if !self.enabled() {
++            return;
++        }
++        let mut st = match self.0.lock() {
++            Ok(s) => s,
++            Err(_) => return,
++        };
++        let t = st.epoch.elapsed().as_secs_f64();
++        if st.pending.remove(&id).is_none() {
++            return; // 已判过命中
++        }
++        if let Some(f) = &mut st.file {
++            let _ = writeln!(f, r#"{{"ev":"miss","t":{t:.6},"shot_id":{id}}}"#);
++        }
++    }
++}
+--- a/src/spin.rs
++++ b/src/spin.rs
+@@ -0,0 +1,1069 @@
++//! 敌方步兵「小陀螺」运动曲线
++//!
++//! 两种用途:
++//! - **慢速固定旋转** ([`SpinMode::Slow`]): 原地以恒定 3.0 rad/s 匀速自转,
++//!   等价于改造前的 `Quat::from_rotation_y(3.0 * t)`。
++//! - **变速小陀螺** ([`SpinMode::Triangle`] / [`SpinMode::Constant`] / [`SpinMode::Regular`]
++//!   / [`SpinMode::Irregular`]): 高速自转并做变速, 用于测试我方自瞄的跟踪 / 运动预测 / 装甲板切换。
++//!
++//! [`SpinMode::Triangle`] 是确定性理想三角波:
++//! ```text
++//! omega(t): 在 [min_omega, max_omega] 之间线性往复 (三角波)
++//! alpha(t): 纯方波, 恒为 ±alpha_max, 没有 0 (匀速) 段
++//! alpha_max = (max_omega - min_omega) / t_acc
++//! 周期     = 2 * t_acc
++//! ```
++//! 关系满足 `omega = ∫ alpha dt`, 且 `omega` 到端点时 `alpha` 立即反号。
++//!
++//! 注意: `min_omega` 允许为负。此时 `omega` 会持续穿过 0 换向, 半周期内 `∫ omega dt = 0`,
++//! 累计转角只在有限范围内往复 —— 表现为**原地小幅摇摆**, 而不是单调自转。
++//! 角度极值出现在 `omega` 穿过 0 的那一刻, 大小为 `端点² / (2 * alpha_max)`;
++//! (当前默认 `[-4, 4] / t_acc = 0.50` → 摆幅 `±4²/(2*16) = ±0.5 rad ≈ ±28.6°`。)
++//!
++//! 设计要点:
++//! - 曲线推进与 ECS 完全解耦 (纯函数 [`advance_spin`]), 便于单元测试与数值验证。
++//! - 时间/角度/角速度内部一律 `f64`, 只在构造 Bevy 四元数时降到 `f32`。
++//! - 累计转角连续不重置; 每个实体持有独立状态与随机数种子。
++//! - 使用仿真时间推进 (暂停即停止)。
++//!
++//! 单位: 角速度 rad/s, 角度 rad, 时间 s。
++
++use bevy::prelude::*;
++
++/// 规律变速模式的固定保持时间 (s)
++const REGULAR_HOLD: f64 = 0.35;
++
++/// 阶段切换的安全上限, 防止极端 dt 下死循环
++const MAX_STAGES_PER_STEP: u32 = 256;
++
++/// 三角波模式允许的最短加速时间 (s), 防止 `alpha_max` 大到数值上不可用
++const MIN_T_ACC: f64 = 1e-3;
++
++/// 旋转模式
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SpinMode {
++    /// 慢速固定旋转: 原地以 `slow_omega` (默认 3.0 rad/s) 匀速自转, 无加速段。
++    /// 等价于改造前的 `Quat::from_rotation_y(3.0 * t)`。
++    Slow,
++    /// 三角波: `omega` 在 `[min_omega, max_omega]` 之间连续线性往复,
++    /// `alpha` 恒为 ±`alpha_max` (纯方波, **没有匀速段**), `alpha_max = (max-min)/t_acc`。
++    Triangle,
++    /// 恒速基线: 加速到 `max_omega` 后恒定不变
++    Constant,
++    /// 规律变速: `min_omega` <-> `max_omega` 交替, 固定保持 0.35 s
++    Regular,
++    /// 不规则变速: [`min_omega`, `max_omega`] 内随机, 保持 `hold_min`~`hold_max`
++    Irregular,
++}
++
++impl SpinMode {
++    /// 供真值输出使用的数值编码
++    pub fn as_u8(self) -> u8 {
++        match self {
++            SpinMode::Constant => 0,
++            SpinMode::Regular => 1,
++            SpinMode::Irregular => 2,
++            SpinMode::Slow => 3,
++            SpinMode::Triangle => 4,
++        }
++    }
++
++    fn parse(s: &str) -> Option<Self> {
++        match s.trim().to_ascii_lowercase().as_str() {
++            "slow" | "legacy" | "fixed" | "static" => Some(SpinMode::Slow),
++            "triangle" | "tri" | "triwave" | "wave" => Some(SpinMode::Triangle),
++            "constant" | "const" | "baseline" => Some(SpinMode::Constant),
++            "regular" => Some(SpinMode::Regular),
++            "irregular" | "random" => Some(SpinMode::Irregular),
++            _ => None,
++        }
++    }
++}
++
++/// 曲线配置 (Resource)。可用环境变量覆盖, 见 [`SpinConfig::from_env`]。
++#[derive(Resource, Clone, Debug)]
++pub struct SpinConfig {
++    /// 正常循环角速度下限 (rad/s)
++    pub min_omega: f64,
++    /// 正常循环角速度上限 (rad/s)
++    pub max_omega: f64,
++    /// 角加速度大小 (rad/s², >0)。用于 Constant / Regular / Irregular 三种模式。
++    /// [`SpinMode::Triangle`] **不使用**该值, 它由 `t_acc` 反推, 见 [`SpinConfig::alpha_max`]。
++    pub alpha: f64,
++    /// [`SpinMode::Triangle`] 的单程加速/减速时间 (s, >0)。
++    /// `alpha_max = (max_omega - min_omega) / t_acc`, 三角波周期 = `2 * t_acc`。
++    pub t_acc: f64,
++    /// 相邻目标之间的最小速度差 (rad/s)
++    pub min_delta: f64,
++    /// 保持时间下限 (s)
++    pub hold_min: f64,
++    /// 保持时间上限 (s)
++    pub hold_max: f64,
++    /// [`SpinMode::Slow`] 模式下的恒定角速度 (rad/s)
++    pub slow_omega: f64,
++    /// 随机种子 (固定以保证可复现)
++    pub seed: u64,
++    /// 模式
++    pub mode: SpinMode,
++}
++
++impl Default for SpinConfig {
++    fn default() -> Self {
++        Self {
++            min_omega: -4.0,
++            max_omega: 4.0,
++            alpha: 120.0,
++            t_acc: 0.50,
++            min_delta: 3.0,
++            hold_min: 0.20,
++            hold_max: 0.50,
++            slow_omega: 3.0,
++            seed: 20261009,
++            // 默认 = 三角波 (omega -4 <-> +4 线性往复, alpha 恒为 ±16 rad/s² 纯方波, 周期 1.0 s);
++            // 注意 omega 会持续穿过 0 换向, 半周期内 ∫omega dt = 0, 所以累计转角只在
++            // ±4²/(2*16) = ±0.5 rad (±28.6°) 内往复 —— 敌方车是**原地摇摆**, 不是连续自转。
++            // 想换回随机变速用 SPIN_MODE=irregular, 回到 3 rad/s 匀速用 SPIN_MODE=slow。
++            mode: SpinMode::Triangle,
++        }
++    }
++}
++
++impl SpinConfig {
++    /// 从环境变量读取并校验。
++    ///
++    /// 支持: `SPIN_MODE`(triangle|slow|constant|regular|irregular)、`SPIN_SLOW_OMEGA`、
++    /// `SPIN_MIN`、`SPIN_MAX`、`SPIN_T_ACC`、`SPIN_ALPHA`、`SPIN_MIN_DELTA`、
++    /// `SPIN_HOLD_MIN`、`SPIN_HOLD_MAX`、`SPIN_SEED`。
++    pub fn from_env() -> Self {
++        let mut cfg = Self::default();
++
++        if let Ok(v) = std::env::var("SPIN_MODE") {
++            match SpinMode::parse(&v) {
++                Some(m) => cfg.mode = m,
++                None => warn!("[SPIN] 无法识别的 SPIN_MODE={v:?}, 使用默认 {:?}", cfg.mode),
++            }
++        }
++        if let Some(v) = env_f64("SPIN_SLOW_OMEGA") {
++            cfg.slow_omega = v;
++        }
++        if let Some(v) = env_f64("SPIN_MIN") {
++            cfg.min_omega = v;
++        }
++        if let Some(v) = env_f64("SPIN_MAX") {
++            cfg.max_omega = v;
++        }
++        if let Some(v) = env_f64("SPIN_T_ACC") {
++            cfg.t_acc = v;
++        }
++        if let Some(v) = env_f64("SPIN_ALPHA") {
++            cfg.alpha = v;
++        }
++        if let Some(v) = env_f64("SPIN_MIN_DELTA") {
++            cfg.min_delta = v;
++        }
++        if let Some(v) = env_f64("SPIN_HOLD_MIN") {
++            cfg.hold_min = v;
++        }
++        if let Some(v) = env_f64("SPIN_HOLD_MAX") {
++            cfg.hold_max = v;
++        }
++        if let Ok(v) = std::env::var("SPIN_SEED") {
++            match v.trim().parse::<u64>() {
++                Ok(s) => cfg.seed = s,
++                Err(_) => warn!("[SPIN] 无法解析 SPIN_SEED={v:?}, 使用默认 {}", cfg.seed),
++            }
++        }
++
++        cfg.validate();
++        info!(
++            "[SPIN] mode={:?} slow_omega={} omega=[{},{}] t_acc={} alpha={} (triangle: alpha_max={}, period={}) hold=[{},{}] seed={}",
++            cfg.mode,
++            cfg.slow_omega,
++            cfg.min_omega,
++            cfg.max_omega,
++            cfg.t_acc,
++            cfg.alpha,
++            cfg.alpha_max(),
++            cfg.t_acc * 2.0,
++            cfg.hold_min,
++            cfg.hold_max,
++            cfg.seed
++        );
++        cfg
++    }
++
++    /// 校验并修正非法参数。返回是否发生过修正。
++    pub fn validate(&mut self) -> bool {
++        let d = Self::default();
++        let mut fixed = false;
++
++        if !self.min_omega.is_finite()
++            || !self.max_omega.is_finite()
++            || self.min_omega >= self.max_omega
++        {
++            warn!(
++                "[SPIN] 非法速度范围 [{}, {}], 回退默认 [{}, {}]",
++                self.min_omega, self.max_omega, d.min_omega, d.max_omega
++            );
++            self.min_omega = d.min_omega;
++            self.max_omega = d.max_omega;
++            fixed = true;
++        }
++        if !self.alpha.is_finite() || self.alpha <= 0.0 {
++            warn!("[SPIN] 非法角加速度 {}, 回退默认 {}", self.alpha, d.alpha);
++            self.alpha = d.alpha;
++            fixed = true;
++        }
++        if !self.t_acc.is_finite() || self.t_acc < MIN_T_ACC {
++            warn!(
++                "[SPIN] 非法加速时间 {} (需 >= {}), 回退默认 {}",
++                self.t_acc, MIN_T_ACC, d.t_acc
++            );
++            self.t_acc = d.t_acc;
++            fixed = true;
++        }
++        if !self.hold_min.is_finite()
++            || !self.hold_max.is_finite()
++            || self.hold_min <= 0.0
++            || self.hold_min > self.hold_max
++        {
++            warn!(
++                "[SPIN] 非法保持时间 [{}, {}], 回退默认 [{}, {}]",
++                self.hold_min, self.hold_max, d.hold_min, d.hold_max
++            );
++            self.hold_min = d.hold_min;
++            self.hold_max = d.hold_max;
++            fixed = true;
++        }
++        if !self.min_delta.is_finite() || self.min_delta < 0.0 {
++            warn!("[SPIN] 非法最小速度差 {}, 回退默认 {}", self.min_delta, d.min_delta);
++            self.min_delta = d.min_delta;
++            fixed = true;
++        }
++        // min_delta 超过整个速度区间时永远选不出合法目标, 收敛到区间一半
++        let span = self.max_omega - self.min_omega;
++        if self.min_delta > span {
++            warn!(
++                "[SPIN] min_delta {} 超过速度区间 {}, 收敛为 {}",
++                self.min_delta,
++                span,
++                span * 0.5
++            );
++            self.min_delta = span * 0.5;
++            fixed = true;
++        }
++        if !self.slow_omega.is_finite() || self.slow_omega <= 0.0 {
++            warn!(
++                "[SPIN] 非法慢速角速度 {}, 回退默认 {}",
++                self.slow_omega, d.slow_omega
++            );
++            self.slow_omega = d.slow_omega;
++            fixed = true;
++        }
++
++        fixed
++    }
++
++    /// 三角波模式的角加速度幅值: `alpha_max = (max_omega - min_omega) / t_acc`。
++    ///
++    /// 该模式下 `alpha` 只取 `+alpha_max` / `-alpha_max`, **没有 0 (匀速) 段**。
++    pub fn alpha_max(&self) -> f64 {
++        (self.max_omega - self.min_omega) / self.t_acc
++    }
++
++    /// 从 0 启动时的首个目标角速度
++    pub fn initial_target(&self) -> f64 {
++        match self.mode {
++            SpinMode::Slow => self.slow_omega,
++            // Triangle 先向上限加速 (初始角速度由 `SpinState::from_config` 设到下限)
++            _ => self.max_omega,
++        }
++    }
++}
++
++fn env_f64(key: &str) -> Option<f64> {
++    match std::env::var(key) {
++        Ok(v) => match v.trim().parse::<f64>() {
++            Ok(x) => Some(x),
++            Err(_) => {
++                warn!("[SPIN] 无法解析 {key}={v:?}, 忽略该项");
++                None
++            }
++        },
++        Err(_) => None,
++    }
++}
++
++/// 曲线阶段
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SpinPhase {
++    /// 变速: 以 ±`alpha` 逼近目标角速度
++    Accelerating,
++    /// 保持: 角速度恒定
++    Holding,
++}
++
++impl SpinPhase {
++    /// 供真值输出使用的数值编码
++    pub fn as_u8(self) -> u8 {
++        match self {
++            SpinPhase::Accelerating => 0,
++            SpinPhase::Holding => 1,
++        }
++    }
++}
++
++/// 每个敌方实体独立的旋转状态。
++#[derive(Component, Clone, Debug)]
++pub struct SpinState {
++    /// 累计转角 (rad), 连续不重置
++    pub angle: f64,
++    /// 当前角速度 (rad/s)
++    pub omega: f64,
++    /// 目标角速度 (rad/s); 保持阶段等于当前角速度
++    pub target: f64,
++    /// 当前阶段
++    pub phase: SpinPhase,
++    /// 保持阶段剩余时间 (s); 恒速模式为无穷大
++    pub hold_remaining: f64,
++    /// 随机数状态 (SplitMix64)
++    pub rng: u64,
++    /// 最近一次阶段切换的仿真时间 (s)
++    pub event_t: f64,
++    /// 最近一次积分使用的角加速度 (rad/s²), 仅诊断用
++    pub alpha_now: f64,
++}
++
++impl SpinState {
++    /// 新建: 角速度 0, 阶段 = 变速, 首个目标为 `first_target`。
++    pub fn new(seed: u64, first_target: f64) -> Self {
++        Self {
++            angle: 0.0,
++            omega: 0.0,
++            target: first_target,
++            phase: SpinPhase::Accelerating,
++            hold_remaining: 0.0,
++            rng: seed,
++            event_t: 0.0,
++            alpha_now: 0.0,
++        }
++    }
++
++    /// 按配置初始化。
++    ///
++    /// 与 [`SpinState::new`] 的区别: [`SpinMode::Triangle`] 从 `min_omega` 出发 (而不是 0),
++    /// 这样第一帧起就是三角波本身, 不会出现 `0 -> min_omega` 的启动斜坡。
++    pub fn from_config(cfg: &SpinConfig) -> Self {
++        let mut st = Self::new(cfg.seed, cfg.initial_target());
++        if cfg.mode == SpinMode::Triangle {
++            st.omega = cfg.min_omega;
++            st.target = cfg.max_omega;
++        }
++        st
++    }
++}
++
++/// 推进曲线 `dt` 秒。
++///
++/// 单段内使用解析积分:
++/// ```text
++/// omega_next = omega + alpha * dt
++/// angle_next = angle + omega * dt + 0.5 * alpha * dt * dt
++/// ```
++/// 若一帧跨越阶段边界, 先精确积分到边界, 再用剩余时间进入下一阶段。
++pub fn advance_spin(state: &mut SpinState, cfg: &SpinConfig, dt: f64, sim_t: f64) {
++    if !dt.is_finite() || dt <= 0.0 {
++        return;
++    }
++
++    // 慢速固定旋转: 无加速段, 直接从第一帧起以 slow_omega 匀速累计。
++    // 等价于改造前的 `angle = 3.0 * t`。
++    if cfg.mode == SpinMode::Slow {
++        state.omega = cfg.slow_omega;
++        state.target = cfg.slow_omega;
++        state.phase = SpinPhase::Holding;
++        state.hold_remaining = f64::INFINITY;
++        state.alpha_now = 0.0;
++        state.angle += state.omega * dt;
++        return;
++    }
++
++    // 三角波: omega 在 [min, max] 之间线性往复, alpha 恒为 ±alpha_max (纯方波, 无匀速段)。
++    // 单段内仍用解析积分, 到端点时精确切段并立刻反号, 因此不会累积误差或越界。
++    if cfg.mode == SpinMode::Triangle {
++        let lo = cfg.min_omega;
++        let hi = cfg.max_omega;
++        let alpha_max = cfg.alpha_max();
++
++        // 数值安全: 首次调用时 omega = 0, 直接钳到下限; 任何异常值也一并钳回区间。
++        if !state.omega.is_finite() {
++            state.omega = lo;
++        }
++        state.omega = state.omega.clamp(lo, hi);
++        // 目标必须指向某一端点, 且不能正好是当前所在端点 (否则会原地"换向"卡住)
++        if (state.target != lo && state.target != hi)
++            || (state.omega - state.target).abs() <= 1e-9
++        {
++            state.target = if state.omega - lo <= hi - state.omega {
++                hi
++            } else {
++                lo
++            };
++        }
++
++        state.phase = SpinPhase::Accelerating; // 三角波没有保持段
++        state.hold_remaining = 0.0;
++
++        let mut remaining = dt;
++        let mut guard = 0u32;
++        while remaining > 1e-12 && guard < MAX_STAGES_PER_STEP {
++            guard += 1;
++            let diff = state.target - state.omega;
++            if diff.abs() <= 1e-9 {
++                // 已在端点: 立即换向, 不等待
++                state.omega = state.target;
++                state.target = if state.target >= hi - 1e-9 { lo } else { hi };
++                state.event_t = sim_t - remaining;
++                continue;
++            }
++            let alpha = alpha_max * diff.signum();
++            let t_needed = (diff / alpha).abs();
++            if remaining < t_needed {
++                // 本步到不了端点
++                state.angle += state.omega * remaining + 0.5 * alpha * remaining * remaining;
++                state.omega += alpha * remaining;
++                remaining = 0.0;
++            } else {
++                // 精确积分到端点, 剩余时间进入反向段
++                state.angle += state.omega * t_needed + 0.5 * alpha * t_needed * t_needed;
++                state.omega = state.target;
++                remaining -= t_needed;
++                state.target = if state.target >= hi - 1e-9 { lo } else { hi };
++                state.event_t = sim_t - remaining;
++            }
++        }
++
++        // 收尾: 钳位 + 按"接下来要走的方向"给出方波 alpha
++        state.omega = state.omega.clamp(lo, hi);
++        let diff = state.target - state.omega;
++        state.alpha_now = if diff.abs() <= 1e-9 {
++            if state.omega >= hi - 1e-9 {
++                -alpha_max
++            } else {
++                alpha_max
++            }
++        } else {
++            alpha_max * diff.signum()
++        };
++        return;
++    }
++
++    let mut remaining = dt;
++    let mut guard = 0u32;
++
++    while remaining > 1e-12 && guard < MAX_STAGES_PER_STEP {
++        guard += 1;
++        match state.phase {
++            SpinPhase::Accelerating => {
++                let diff = state.target - state.omega;
++                if diff.abs() <= 1e-9 {
++                    // 已在目标上, 直接进入保持
++                    state.omega = state.target;
++                    state.alpha_now = 0.0;
++                    enter_hold(state, cfg);
++                    state.event_t = sim_t - remaining;
++                    continue;
++                }
++
++                let alpha = cfg.alpha * diff.signum();
++                let t_needed = (diff / alpha).abs();
++
++                if remaining < t_needed {
++                    // 本步不足以到达目标
++                    state.angle += state.omega * remaining + 0.5 * alpha * remaining * remaining;
++                    state.omega += alpha * remaining;
++                    state.alpha_now = alpha;
++                    remaining = 0.0;
++                } else {
++                    // 精确积分到目标, 剩余时间进入保持
++                    state.angle += state.omega * t_needed + 0.5 * alpha * t_needed * t_needed;
++                    state.omega = state.target;
++                    state.alpha_now = alpha;
++                    remaining -= t_needed;
++                    enter_hold(state, cfg);
++                    state.event_t = sim_t - remaining;
++                }
++            }
++            SpinPhase::Holding => {
++                state.alpha_now = 0.0;
++                if remaining < state.hold_remaining {
++                    state.angle += state.omega * remaining;
++                    state.hold_remaining -= remaining;
++                    remaining = 0.0;
++                } else {
++                    // 保持结束: 积分到边界, 选下一个目标并回到变速
++                    state.angle += state.omega * state.hold_remaining;
++                    remaining -= state.hold_remaining;
++                    state.hold_remaining = 0.0;
++                    state.target = pick_target(state, cfg);
++                    state.phase = SpinPhase::Accelerating;
++                    state.event_t = sim_t - remaining;
++                }
++            }
++        }
++    }
++}
++
++/// 到达目标速度 -> 进入保持阶段, 抽取保持时长
++fn enter_hold(state: &mut SpinState, cfg: &SpinConfig) {
++    state.phase = SpinPhase::Holding;
++    state.hold_remaining = match cfg.mode {
++        // Slow 在 `advance_spin` 里提前返回, 不会走到这里; 保险起见与恒速一致。
++        SpinMode::Slow | SpinMode::Constant => f64::INFINITY,
++        // 三角波没有保持段 (advance_spin 里已提前返回), 保持时长 0 表示"立刻换向"。
++        SpinMode::Triangle => 0.0,
++        SpinMode::Regular => REGULAR_HOLD,
++        SpinMode::Irregular => {
++            cfg.hold_min + next_f64(&mut state.rng) * (cfg.hold_max - cfg.hold_min)
++        }
++    };
++}
++
++/// 抽取下一个目标角速度。
++///
++/// 不规则模式下保证与当前速度相差至少 `min_delta`:
++/// 合法区间为 `[min, omega-min_delta] ∪ [omega+min_delta, max]`,
++/// 直接构造区间后按长度加权抽样, 不使用无上限的重试循环。
++fn pick_target(state: &mut SpinState, cfg: &SpinConfig) -> f64 {
++    match cfg.mode {
++        // Slow 在 `advance_spin` 里提前返回, 不会走到这里; 保险起见返回慢速值。
++        SpinMode::Slow => cfg.slow_omega,
++        // 三角波: 折返到另一端点 (advance_spin 里提前返回, 正常不会走到这里)
++        SpinMode::Triangle => {
++            if state.omega >= (cfg.min_omega + cfg.max_omega) * 0.5 {
++                cfg.min_omega
++            } else {
++                cfg.max_omega
++            }
++        }
++        SpinMode::Constant => cfg.max_omega,
++        SpinMode::Regular => {
++            let mid = (cfg.min_omega + cfg.max_omega) * 0.5;
++            if state.omega >= mid {
++                cfg.min_omega
++            } else {
++                cfg.max_omega
++            }
++        }
++        SpinMode::Irregular => {
++            let lo1 = cfg.min_omega;
++            let hi1 = state.omega - cfg.min_delta;
++            let lo2 = state.omega + cfg.min_delta;
++            let hi2 = cfg.max_omega;
++
++            let len1 = (hi1 - lo1).max(0.0);
++            let len2 = (hi2 - lo2).max(0.0);
++            let total = len1 + len2;
++
++            if total <= 1e-12 {
++                // 退化 (区间过窄): 全区间均匀兜底
++                cfg.min_omega + next_f64(&mut state.rng) * (cfg.max_omega - cfg.min_omega)
++            } else {
++                let r = next_f64(&mut state.rng) * total;
++                if r < len1 {
++                    lo1 + r
++                } else {
++                    lo2 + (r - len1)
++                }
++            }
++        }
++    }
++}
++
++/// SplitMix64: 状态推进并返回下一个 64 位随机数
++#[inline]
++fn next_u64(state: &mut u64) -> u64 {
++    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
++    let mut z = *state;
++    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++    z ^ (z >> 31)
++}
++
++/// 返回 `[0, 1)` 的均匀随机数
++#[inline]
++fn next_f64(state: &mut u64) -> f64 {
++    (next_u64(state) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn run(cfg: &SpinConfig, dt: f64, total: f64) -> SpinState {
++        let mut st = SpinState::new(cfg.seed, cfg.initial_target());
++        let mut t = 0.0;
++        while t < total - 1e-12 {
++            advance_spin(&mut st, cfg, dt, t);
++            t += dt;
++        }
++        st
++    }
++
++    /// 变速相关测试的基准配置 (不规则变速)。
++    /// [`SpinConfig::default`] 现在是 Triangle, 这里显式写出以表明测试意图。
++    fn irregular() -> SpinConfig {
++        SpinConfig {
++            mode: SpinMode::Irregular,
++            ..Default::default()
++        }
++    }
++
++    /// 慢速模式: 恒定角速度、无加速段、累计角 = omega * t (等价改造前的 3.0*t)
++    #[test]
++    fn slow_mode_is_constant_omega() {
++        let cfg = SpinConfig {
++            mode: SpinMode::Slow,
++            ..Default::default()
++        };
++        let mut st = SpinState::new(cfg.seed, cfg.initial_target());
++        let dt = 1.0 / 60.0;
++        let mut t = 0.0;
++        for _ in 0..600 {
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            assert!(
++                (st.omega - cfg.slow_omega).abs() < 1e-12,
++                "omega={} 应恒为 {}",
++                st.omega,
++                cfg.slow_omega
++            );
++            assert_eq!(st.phase, SpinPhase::Holding);
++            assert_eq!(st.alpha_now, 0.0);
++        }
++        // 10 s 后累计角 ≈ 3.0 * 10
++        assert!(
++            (st.angle - cfg.slow_omega * 10.0).abs() < 1e-6,
++            "angle={}",
++            st.angle
++        );
++    }
++
++    /// 恒速模式最终应稳定在 max_omega
++    #[test]
++    fn constant_reaches_max() {
++        let cfg = SpinConfig {
++            mode: SpinMode::Constant,
++            ..Default::default()
++        };
++        let st = run(&cfg, 1.0 / 60.0, 5.0);
++        assert!((st.omega - cfg.max_omega).abs() < 1e-6, "omega={}", st.omega);
++    }
++
++    /// 正常循环内角速度不越界 [min, max]
++    #[test]
++    fn omega_within_range() {
++        let cfg = irregular();
++        let mut st = SpinState::new(cfg.seed, cfg.initial_target());
++        let mut t = 0.0;
++        // 跳过启动段
++        for _ in 0..60 {
++            advance_spin(&mut st, &cfg, 1.0 / 60.0, t);
++            t += 1.0 / 60.0;
++        }
++        for _ in 0..6000 {
++            advance_spin(&mut st, &cfg, 1.0 / 60.0, t);
++            t += 1.0 / 60.0;
++            assert!(
++                st.omega >= cfg.min_omega - 1e-9 && st.omega <= cfg.max_omega + 1e-9,
++                "omega={} 越界",
++                st.omega
++            );
++        }
++    }
++
++    /// 到达目标时无超调: 角速度不应越过目标再回来
++    #[test]
++    fn no_overshoot() {
++        let cfg = irregular();
++        let mut st = SpinState::new(cfg.seed, cfg.initial_target());
++        let mut t = 0.0;
++        let mut prev = st.omega;
++        let mut prev_target = st.target;
++        for _ in 0..6000 {
++            advance_spin(&mut st, &cfg, 1.0 / 60.0, t);
++            t += 1.0 / 60.0;
++            if st.target != prev_target {
++                // 目标切换时允许方向改变
++                prev_target = st.target;
++                prev = st.omega;
++                continue;
++            }
++            // 同一目标内, 角速度应单调趋近, 不越过
++            if (prev_target - prev).abs() > 1e-9 {
++                let dir = (prev_target - prev).signum();
++                assert!(
++                    dir * (st.omega - prev) >= -1e-9,
++                    "出现反向/超调: prev={} now={} target={}",
++                    prev,
++                    st.omega,
++                    prev_target
++                );
++            }
++            prev = st.omega;
++        }
++    }
++
++    /// 变速段斜率应为 ±alpha, 保持段为 0
++    #[test]
++    fn slope_matches_alpha() {
++        let cfg = irregular();
++        let mut st = SpinState::new(cfg.seed, cfg.initial_target());
++        let dt = 1.0 / 1000.0;
++        let mut t = 0.0;
++        for _ in 0..3000 {
++            let before = (st.omega, st.phase, st.target);
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            if st.phase == SpinPhase::Accelerating && before.1 == SpinPhase::Accelerating {
++                let d = (st.omega - before.0) / dt;
++                if d.abs() > 1e-9 {
++                    assert!(
++                        (d.abs() - cfg.alpha).abs() < 1e-6,
++                        "斜率 {} 不等于 alpha {}",
++                        d,
++                        cfg.alpha
++                    );
++                }
++            }
++        }
++    }
++
++    /// 大 dt 与小步推进结果一致 (跨阶段正确性)
++    #[test]
++    fn big_step_matches_small_steps() {
++        let cfg = irregular();
++
++        let mut a = SpinState::new(cfg.seed, cfg.initial_target());
++        let mut t = 0.0;
++        while t < 3.0 - 1e-12 {
++            advance_spin(&mut a, &cfg, 0.1, t);
++            t += 0.1;
++        }
++
++        let mut b = SpinState::new(cfg.seed, cfg.initial_target());
++        let mut t = 0.0;
++        while t < 3.0 - 1e-12 {
++            advance_spin(&mut b, &cfg, 1.0 / 600.0, t);
++            t += 1.0 / 600.0;
++        }
++
++        // 用相对误差比较累计角度
++        let denom = a.angle.abs().max(1.0);
++        let rel = (a.angle - b.angle).abs() / denom;
++        assert!(rel < 1e-3, "大/小步累计角度不一致: {} vs {}", a.angle, b.angle);
++    }
++
++    /// 相同种子 -> 可复现
++    #[test]
++    fn deterministic_with_seed() {
++        let cfg = irregular();
++        let a = run(&cfg, 1.0 / 60.0, 20.0);
++        let b = run(&cfg, 1.0 / 60.0, 20.0);
++        assert_eq!(a.omega.to_bits(), b.omega.to_bits());
++        assert_eq!(a.target.to_bits(), b.target.to_bits());
++    }
++
++    /// 不同种子 -> 序列不同
++    #[test]
++    fn different_seeds_differ() {
++        let cfg = irregular();
++        let a = run(&cfg, 1.0 / 60.0, 20.0);
++        let cfg2 = SpinConfig {
++            seed: cfg.seed + 1,
++            ..cfg.clone()
++        };
++        let b = run(&cfg2, 1.0 / 60.0, 20.0);
++        assert!(a.angle.to_bits() != b.angle.to_bits());
++    }
++
++    /// 非法配置会被修正, 不 panic、不死循环
++    #[test]
++    fn invalid_config_is_fixed() {
++        let mut cfg = SpinConfig {
++            min_omega: 20.0,
++            max_omega: 10.0,
++            alpha: -5.0,
++            hold_min: 0.5,
++            hold_max: 0.1,
++            min_delta: 999.0,
++            ..Default::default()
++        };
++        assert!(cfg.validate());
++        assert!(cfg.min_omega < cfg.max_omega);
++        assert!(cfg.alpha > 0.0);
++        assert!(cfg.hold_min <= cfg.hold_max);
++        assert!(cfg.min_delta <= cfg.max_omega - cfg.min_omega);
++        // 仍可正常运行
++        let _ = run(&cfg, 1.0 / 60.0, 2.0);
++    }
++
++    /// 规律模式应在 min/max 之间交替
++    #[test]
++    fn regular_alternates() {
++        let cfg = SpinConfig {
++            mode: SpinMode::Regular,
++            ..Default::default()
++        };
++        let mut st = SpinState::new(cfg.seed, cfg.initial_target());
++        let mut t = 0.0;
++        let mut targets = Vec::new();
++        let mut last = st.target;
++        for _ in 0..6000 {
++            advance_spin(&mut st, &cfg, 1.0 / 60.0, t);
++            t += 1.0 / 60.0;
++            if st.target != last {
++                targets.push(st.target);
++                last = st.target;
++            }
++        }
++        assert!(targets.len() >= 4, "切换次数太少: {targets:?}");
++        for w in targets.windows(2) {
++            assert!((w[0] - w[1]).abs() > 1.0, "未在 min/max 间交替: {targets:?}");
++        }
++    }
++
++    // ================= 三角波模式 =================
++
++    /// 三角波基准配置: 10 ~ 18 rad/s, 单程 0.20 s -> alpha_max = 40 rad/s²
++    fn triangle() -> SpinConfig {
++        SpinConfig {
++            mode: SpinMode::Triangle,
++            min_omega: 10.0,
++            max_omega: 18.0,
++            t_acc: 0.20,
++            ..Default::default()
++        }
++    }
++
++    /// alpha_max 必须等于 (max - min) / t_acc
++    #[test]
++    fn triangle_alpha_max_from_t_acc() {
++        let cfg = triangle();
++        assert!((cfg.alpha_max() - 40.0).abs() < 1e-12, "{}", cfg.alpha_max());
++        let cfg2 = SpinConfig { t_acc: 0.5, ..triangle() };
++        assert!((cfg2.alpha_max() - 16.0).abs() < 1e-12, "{}", cfg2.alpha_max());
++        // 非法 t_acc 会被 validate 修正
++        let mut bad = SpinConfig { t_acc: 0.0, ..triangle() };
++        assert!(bad.validate());
++        assert!(bad.t_acc > 0.0);
++    }
++
++    /// alpha 必须是纯方波: 只取 ±alpha_max, 绝不为 0, 且始终处于变速阶段
++    #[test]
++    fn triangle_alpha_is_pure_square_wave() {
++        let cfg = triangle();
++        let am = cfg.alpha_max();
++        let mut st = SpinState::from_config(&cfg);
++        let dt = 1.0 / 1000.0;
++        let mut t = 0.0;
++        let (mut saw_pos, mut saw_neg) = (false, false);
++        for _ in 0..20_000 {
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            assert!(st.alpha_now != 0.0, "alpha 出现 0 (匀速段)");
++            assert!(
++                (st.alpha_now.abs() - am).abs() < 1e-9,
++                "alpha={} 不是 ±{}",
++                st.alpha_now,
++                am
++            );
++            assert_eq!(st.phase, SpinPhase::Accelerating, "三角波不应出现保持段");
++            if st.alpha_now > 0.0 {
++                saw_pos = true;
++            } else {
++                saw_neg = true;
++            }
++        }
++        assert!(saw_pos && saw_neg, "alpha 未正负交替");
++    }
++
++    /// omega 始终在 [min, max] 内, 且两端都要到达
++    #[test]
++    fn triangle_omega_stays_in_range_and_hits_both_ends() {
++        let cfg = triangle();
++        let mut st = SpinState::from_config(&cfg);
++        let dt = 1.0 / 1000.0;
++        let mut t = 0.0;
++        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
++        for _ in 0..20_000 {
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            assert!(
++                st.omega >= cfg.min_omega - 1e-9 && st.omega <= cfg.max_omega + 1e-9,
++                "omega={} 越界",
++                st.omega
++            );
++            lo = lo.min(st.omega);
++            hi = hi.max(st.omega);
++        }
++        assert!((lo - cfg.min_omega).abs() < 1e-6, "未到达下限 min={lo}");
++        assert!((hi - cfg.max_omega).abs() < 1e-6, "未到达上限 max={hi}");
++    }
++
++    /// 单程时间 (相邻两次换向的间隔) 必须等于 t_acc
++    #[test]
++    fn triangle_ramp_time_matches_t_acc() {
++        let cfg = triangle();
++        let mut st = SpinState::from_config(&cfg);
++        let dt = 1.0 / 10_000.0;
++        let mut t = 0.0;
++        let mut flips: Vec<f64> = Vec::new();
++        let mut last = st.target;
++        for _ in 0..200_000 {
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            if st.target != last {
++                flips.push(t);
++                last = st.target;
++            }
++        }
++        assert!(flips.len() >= 8, "换向次数太少: {}", flips.len());
++        for w in flips.windows(2) {
++            let d = w[1] - w[0];
++            assert!(
++                (d - cfg.t_acc).abs() < 1e-3,
++                "单程时间 {} != t_acc {}",
++                d,
++                cfg.t_acc
++            );
++        }
++    }
++
++    /// omega 必须是 alpha 的积分: d(omega)/dt == alpha_now (换向那一步除外)
++    #[test]
++    fn triangle_omega_is_integral_of_alpha() {
++        let cfg = triangle();
++        let mut st = SpinState::from_config(&cfg);
++        let dt = 1.0 / 2000.0;
++        let mut t = 0.0;
++        let mut checked = 0;
++        for _ in 0..40_000 {
++            let before = st.omega;
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            let slope = (st.omega - before) / dt;
++            if (slope - st.alpha_now).abs() > 1e-6 {
++                continue; // 这一步跨了端点, alpha 已反号
++            }
++            assert!((slope - st.alpha_now).abs() < 1e-6, "d(omega)/dt != alpha");
++            checked += 1;
++        }
++        assert!(checked > 30_000, "有效步数太少: {checked}");
++    }
++
++    /// 大 dt 与小步推进结果一致 (跨端点正确性)
++    #[test]
++    fn triangle_big_step_matches_small_steps() {
++        let cfg = triangle();
++        let mut a = SpinState::from_config(&cfg);
++        let mut t = 0.0;
++        while t < 5.0 - 1e-12 {
++            advance_spin(&mut a, &cfg, 0.1, t);
++            t += 0.1;
++        }
++        let mut b = SpinState::from_config(&cfg);
++        let mut t = 0.0;
++        while t < 5.0 - 1e-12 {
++            advance_spin(&mut b, &cfg, 1.0 / 2000.0, t);
++            t += 1.0 / 2000.0;
++        }
++        let rel = (a.angle - b.angle).abs() / b.angle.abs().max(1.0);
++        assert!(rel < 1e-4, "大/小步累计角不一致: {} vs {}", a.angle, b.angle);
++        assert!((a.omega - b.omega).abs() < 1e-3, "omega 不一致");
++    }
++
++    // ================= 负下限三角波 (原地摇摆) =================
++
++    /// 负下限基准配置: -4 ~ +4 rad/s, 单程 0.50 s -> alpha_max = 16 rad/s² (与当前默认一致)。
++    /// omega 会持续穿过 0 换向, 半周期 `∫ omega dt = 0`, 累计转角只在有限范围内往复。
++    fn triangle_negative() -> SpinConfig {
++        SpinConfig {
++            mode: SpinMode::Triangle,
++            min_omega: -4.0,
++            max_omega: 4.0,
++            t_acc: 0.50,
++            ..Default::default()
++        }
++    }
++
++    /// 负下限: alpha_max = (max - min) / t_acc = 8 / 0.50 = 16, 且默认配置本身合法
++    #[test]
++    fn triangle_negative_alpha_max() {
++        let mut cfg = triangle_negative();
++        assert!((cfg.alpha_max() - 16.0).abs() < 1e-12, "{}", cfg.alpha_max());
++        assert!(!cfg.validate(), "负下限配置是合法的, 不该被 validate 修正");
++    }
++
++    /// 出厂默认 `SpinConfig::default()` 必须与文档一致: -4 ~ +4 / t_acc = 0.50
++    #[test]
++    fn default_config_is_minus4_to_4_period_1s() {
++        let cfg = SpinConfig::default();
++        assert_eq!(cfg.mode, SpinMode::Triangle);
++        assert!((cfg.min_omega - (-4.0)).abs() < 1e-12);
++        assert!((cfg.max_omega - 4.0).abs() < 1e-12);
++        assert!((cfg.t_acc - 0.50).abs() < 1e-12);
++        assert!((cfg.alpha_max() - 16.0).abs() < 1e-12);
++        assert!((2.0 * cfg.t_acc - 1.0).abs() < 1e-12, "周期应为 1 s");
++    }
++
++    /// 负下限: omega 仍精确扫过 [-4, +4], alpha 恒为 ±16, 且摆幅等于解析极值
++    #[test]
++    fn triangle_negative_wobbles_within_t_acc() {
++        let cfg = triangle_negative();
++        let am = cfg.alpha_max();
++        // 角度极值出现在 omega 穿过 0 的那一刻 (t = |端点| / alpha_max),
++        // 该处角度 = ∓(端点)² / (2 * alpha_max)。整个摆动范围就是这两个极值。
++        let amp = cfg.min_omega.abs().powi(2).max(cfg.max_omega.abs().powi(2)) / (2.0 * am);
++        let mut st = SpinState::from_config(&cfg);
++        let dt = 1.0 / 500.0;
++        let mut t = 0.0;
++        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
++        let (mut a_lo, mut a_hi) = (f64::INFINITY, f64::NEG_INFINITY);
++        for _ in 0..5000 {
++            advance_spin(&mut st, &cfg, dt, t);
++            t += dt;
++            assert!(
++                st.omega >= cfg.min_omega - 1e-9 && st.omega <= cfg.max_omega + 1e-9,
++                "omega={} 越界",
++                st.omega
++            );
++            assert!(
++                (st.alpha_now.abs() - am).abs() < 1e-9,
++                "alpha={} 应为 ±{}",
++                st.alpha_now,
++                am
++            );
++            lo = lo.min(st.omega);
++            hi = hi.max(st.omega);
++            a_lo = a_lo.min(st.angle);
++            a_hi = a_hi.max(st.angle);
++        }
++        assert!((lo - cfg.min_omega).abs() < 1e-6, "未到达下限 min={lo}");
++        assert!((hi - cfg.max_omega).abs() < 1e-6, "未到达上限 max={hi}");
++        // 摆动幅度 = 解析极值 (半个帧步的采样误差内)
++        assert!(
++            a_hi - amp < 1e-3 && a_lo + amp > -1e-3,
++            "摆动范围 [{}, {}] 应逼近 ±{}",
++            a_lo,
++            a_hi,
++            amp
++        );
++        assert!(
++            (a_hi - a_lo) > amp * 1.9,
++            "摆动峰峰值 {} 远小于 2*amp {}, 曲线可能没走满",
++            a_hi - a_lo,
++            2.0 * amp
++        );
++    }
++}
+--- a/src/statistic.rs
++++ b/src/statistic.rs
+@@ -1,6 +1,7 @@
+ static mut LAUNCH_COUNT: u32 = 0;
+ static mut ACCURATE_COUNT: u32 = 0;
+ static mut INFANTRY_HIT_COUNT: u32 = 0;
++static mut INFANTRY_NEAR_HIT_COUNT: u32 = 0;
+ 
+ pub fn increase_launch() {
+     unsafe {
+@@ -47,3 +48,28 @@
+     }
+     (infantry_hit_count() as f32) / (launches as f32)
+ }
++
++/// 近侧命中：被击中的那块装甲板的外法线朝向炮口，也就是自瞄本来打算打的那一块。
++///
++/// 为什么单独记这个：`infantry_hit_pct` 被仿真几何放大了 —— 弹丸会穿过车体
++/// (碰撞层不相交)，而 4 块板间隔 90°、切向角容差 ±24.7°，所以打错一块板、
++/// 或者穿堂打到对面板，都照样算命中。yaw 误差完全随机时它仍有约 0.79，
++/// 健康估计是 1.00，区分不出好坏。近侧命中把烂估计压到约 0.5，才有区分度。
++/// 量化脚本见 tools/hit_prob_model.py。
++pub fn increase_infantry_near_hit() {
++    unsafe {
++        INFANTRY_NEAR_HIT_COUNT += 1;
++    }
++}
++
++pub fn infantry_near_hit_count() -> u32 {
++    unsafe { INFANTRY_NEAR_HIT_COUNT }
++}
++
++pub fn infantry_near_hit_pct() -> f32 {
++    let launches = launch_count();
++    if launches == 0 {
++        return 0.0;
++    }
++    (infantry_near_hit_count() as f32) / (launches as f32)
++}
+--- a/src/ros2/capture.rs
++++ b/src/ros2/capture.rs
+@@ -27,10 +27,67 @@
+ use r2r::sensor_msgs::msg::{CameraInfo, RegionOfInterest};
+ use r2r::std_msgs::msg::Header;
+ use std::sync::{
+-    Arc, Mutex,
+-    atomic::{AtomicBool, Ordering},
++    Arc, Mutex, OnceLock,
++    atomic::{AtomicU64, AtomicBool, Ordering},
+ };
+-use std::time::Duration;
++use std::time::{Duration, Instant};
++
++// ─────────────────────────────────────────────────────────────────────────────
++// [CAM] 采集链路诊断计数器 (2026-10-13 加入)
++//
++// 背景: 自瞄侧实测只收到 ~0.6 帧/s, 而 [SIM_GT] 显示仿真本体跑 140+ fps、
++//   RateLimiter 上限 60 Hz ⇒ 必须区分「仿真没在出图」和「出了图但发不出去」。
++//   TopicPublisher::publish 用的是 try_send, 通道满了会**静默丢帧**;
++//   publisher 线程在 publish() 报错时也是 while !sent 里静默丢。
++//   所以这里同时统计: 采集任务数 / poll(Wait) 耗时 / 任务总耗时 / DDS 发送失败数。
++//
++// 输出: 每 ~2 s 一行 [CAM] n=<窗口内任务数> hz=<> poll=<>ms task=<>ms send_err=<>
++//   send_err 是 topic.rs 里 PUB_WRITE_ERR + PUB_TRY_SEND_ERR 的增量。
++// ─────────────────────────────────────────────────────────────────────────────
++static CAM_TASKS: AtomicU64 = AtomicU64::new(0);
++static CAM_POLL_US: AtomicU64 = AtomicU64::new(0);
++static CAM_TASK_US: AtomicU64 = AtomicU64::new(0);
++static CAM_SKIPPED: AtomicU64 = AtomicU64::new(0);
++static CAM_EPOCH: OnceLock<Instant> = OnceLock::new();
++static CAM_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
++
++/// 每个采集任务结束时调用一次；每 ~2 s 打一行 [CAM]。
++fn cam_stat_log(poll_us: u64, task_us: u64) {
++    let epoch = *CAM_EPOCH.get_or_init(Instant::now);
++    let n = CAM_TASKS.fetch_add(1, Ordering::Relaxed) + 1;
++    CAM_POLL_US.fetch_add(poll_us, Ordering::Relaxed);
++    CAM_TASK_US.fetch_add(task_us, Ordering::Relaxed);
++
++    let now_ms = epoch.elapsed().as_millis() as u64;
++    let last = CAM_LAST_LOG_MS.load(Ordering::Relaxed);
++    if now_ms.saturating_sub(last) < 2000 {
++        return;
++    }
++    if CAM_LAST_LOG_MS
++        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
++        .is_err()
++    {
++        return; // 另一个任务已经打过这一轮
++    }
++    let win_ms = now_ms.saturating_sub(last).max(1);
++    let inv = 1.0 / n as f64;
++    let send_err = crate::ros2::topic::take_publish_errors();
++    info!(
++        "[CAM] n={} hz={:.2} poll={:.2}ms task={:.2}ms skipped={} send_err={}",
++        n,
++        n as f64 * 1000.0 / win_ms as f64,
++        CAM_POLL_US.swap(0, Ordering::Relaxed) as f64 * inv / 1000.0,
++        CAM_TASK_US.swap(0, Ordering::Relaxed) as f64 * inv / 1000.0,
++        CAM_SKIPPED.swap(0, Ordering::Relaxed),
++        send_err,
++    );
++    CAM_TASKS.store(0, Ordering::Relaxed);
++}
++
++/// 采集任务被 `copying` 门挡掉的次数（说明回读还没回来，主循环来早了）。
++pub(crate) fn cam_stat_skipped() {
++    CAM_SKIPPED.fetch_add(1, Ordering::Relaxed);
++}
+ 
+ #[derive(Resource, Clone)]
+ pub struct CaptureConfig {
+@@ -153,8 +210,6 @@
+         return;
+     }
+     r.reset();
+-    let ctx = Arc::new(ctx.clone());
+-    let config = Arc::new(config.clone());
+     let (width, height, texture_format) = (config.width, config.height, config.texture_format);
+     for image_copier in image_copiers.0.iter() {
+         if !image_copier.enabled() {
+@@ -168,10 +223,11 @@
+         {
+             let render_device = render_device.clone();
+             let image_copier = image_copier.clone();
+-            let ctx = ctx.clone();
+-            let config = config.clone();
++            let ctx = (*ctx).clone();
++            let config = (*config).clone();
+             AsyncComputeTaskPool::get()
+                 .spawn(async move {
++                    let t_task = Instant::now();
+                     let buffer_slice = image_copier.buffer.slice(..);
+                     let (s, r) = crossbeam_channel::bounded(1);
+ 
+@@ -184,12 +240,13 @@
+                         .poll(PollType::Wait)
+                         .expect("Failed to poll device for map async");
+                     r.recv().expect("Failed to receive the map_async message");
++                    let poll_us = t_task.elapsed().as_micros() as u64;
+ 
+                     let mut image_data = buffer_slice.get_mapped_range().to_vec();
+                     image_copier.buffer.unmap();
+                     image_copier.copying.store(false, Ordering::Release);
+ 
+-                    let image_data = {
++                    let mut image_data = {
+                         let row_bytes = width as usize * texture_format.pixel_size().unwrap();
+                         let aligned_row_bytes = RenderDevice::align_copy_bytes_per_row(row_bytes);
+                         if row_bytes != aligned_row_bytes {
+@@ -211,12 +268,21 @@
+                         ),
+                         frame_id: "camera_optical_frame".to_string(),
+                     };
+-                    ctx.image_compressed.publish(compress_image(
+-                        optical_frame_hdr.clone(),
+-                        width,
+-                        height,
+-                        image_data.clone(),
+-                    ));
++                    // 图像话题发布由环境变量 IMAGE_PUB 控制 (raw / compressed / both / none)
++                    if ctx.publish_compressed {
++                        // Only both topics need separate ownership of the RGB pixels.
++                        let compressed_pixels = if ctx.publish_raw {
++                            image_data.clone()
++                        } else {
++                            std::mem::take(&mut image_data)
++                        };
++                        ctx.image_compressed.publish(compress_image(
++                            optical_frame_hdr.clone(),
++                            width,
++                            height,
++                            compressed_pixels,
++                        ));
++                    }
+                     let (camera_info, image) = compute_camera(
+                         config.fov_y,
+                         optical_frame_hdr,
+@@ -225,10 +291,16 @@
+                         image_data,
+                     );
+                     ctx.camera_info.publish(camera_info);
+-                    // ctx.image_raw.publish(image); // stop raw; keep compressed
+-                    let _ = image;
++                    if ctx.publish_raw {
++                        // 原始 Image (rgb8, 960x720, step=2880) —— 不压缩, 带宽 ~2 MB/帧
++                        ctx.image_raw.publish(image);
++                    }
++                    cam_stat_log(poll_us, t_task.elapsed().as_micros() as u64);
+                 })
+                 .detach();
++        } else {
++            // copying 门被占用 ⇒ 这一帧没有发起回读 (主循环比回读还快)
++            cam_stat_skipped();
+         }
+     }
+ }
+@@ -239,6 +311,10 @@
+     pub camera_info: Arc<TopicPublisher<CameraInfoTopic>>,
+     pub image_raw: Arc<TopicPublisher<ImageRawTopic>>,
+     pub image_compressed: Arc<TopicPublisher<ImageCompressedTopic>>,
++    /// 是否发布 /image_raw（原始 Image）
++    pub publish_raw: bool,
++    /// 是否发布 /image_compressed（JPEG 压缩）
++    pub publish_compressed: bool,
+ }
+ 
+ pub struct RosCapturePlugin {
+@@ -329,23 +405,32 @@
+     >,
+     view_offset: Single<&InfantryViewOffset, With<LocalInfantry>>,
+     mut our: Single<&mut Transform, (With<CaptureCamera>, Without<InfantryGimbal>)>,
++    mut trace: Local<Option<bool>>,
+ ) {
+     let (gimbal_global, gimbal_local) = gimbal.into_inner();
+ 
+-    let (local_yaw, local_pitch, _) =
+-        gimbal_local.rotation.to_euler(EulerRot::YXZ);
+-    let (global_yaw, global_pitch, _) =
+-        gimbal_global.rotation().to_euler(EulerRot::YXZ);
+-
+-    println!(
+-        "[SYNC_CAMERA] local_yaw={:.3} local_pitch={:.3} global_yaw={:.3} global_pitch={:.3} dyaw={:.3} dpitch={:.3}",
+-        local_yaw.to_degrees(),
+-        local_pitch.to_degrees(),
+-        global_yaw.to_degrees(),
+-        global_pitch.to_degrees(),
+-        (local_yaw - global_yaw).to_degrees(),
+-        (local_pitch - global_pitch).to_degrees(),
+-    );
++    // 原来这里逐帧 println!，会把 stdout 刷爆 (实测 8.5 小时写了 108 MB)，也拖慢主循环。
++    // 改成默认关闭，需要时用 SYNC_CAMERA_LOG=1 打开。
++    if *trace.get_or_insert_with(|| {
++        std::env::var("SYNC_CAMERA_LOG")
++            .map(|v| v.trim() == "1")
++            .unwrap_or(false)
++    }) {
++        let (local_yaw, local_pitch, _) =
++            gimbal_local.rotation.to_euler(EulerRot::YXZ);
++        let (global_yaw, global_pitch, _) =
++            gimbal_global.rotation().to_euler(EulerRot::YXZ);
++
++        println!(
++            "[SYNC_CAMERA] local_yaw={:.3} local_pitch={:.3} global_yaw={:.3} global_pitch={:.3} dyaw={:.3} dpitch={:.3}",
++            local_yaw.to_degrees(),
++            local_pitch.to_degrees(),
++            global_yaw.to_degrees(),
++            global_pitch.to_degrees(),
++            (local_yaw - global_yaw).to_degrees(),
++            (local_pitch - global_pitch).to_degrees(),
++        );
++    }
+ 
+     let camera_offset = view_offset.0.translation - gimbal_local.translation;
+     our.translation =
+--- a/src/ros2/gt_udp.rs
++++ b/src/ros2/gt_udp.rs
+@@ -10,7 +10,11 @@
+ //!   "gt": {
+ //!     "gimbal_yaw": 0.12,
+ //!     "gimbal_pitch": 0.05,
+-//!     "enemy_armor_1/x": 1.0, "enemy_armor_1/y": 2.0, "enemy_armor_1/z": 0.3,
++//!     "enemy_center_x": -4.0, "enemy_center_y": -7.0, "enemy_center_z": 0.195,
++//!     "enemy_armor_1_x": 1.0, "enemy_armor_1_y": 2.0, "enemy_armor_1_z": 0.3,
++//!     "spin_angle": 3.14, "spin_omega": 15.2, "spin_target": 18.0,
++//!     "spin_alpha": 120.0, "spin_phase": 0, "spin_mode": 2, "spin_event_t": 1.83,
++//!     "spin_t_acc": 0.2,
+ //!     ...
+ //!   }
+ //! }
+@@ -23,10 +27,34 @@
+ //!   GT_UDP_ENABLE=0             (设为 0 可整体关闭真值 UDP 发送)
+ 
+ use bevy::prelude::*;
++use std::fmt::Write;
+ use std::net::UdpSocket;
+ 
+ /// 默认端口: PlotJuggler UDP Server 的默认监听端口
+ const DEFAULT_PORT: u16 = 9870;
++
++/// 敌方步兵「变速小陀螺」真值快照 (用于曲线对齐与自瞄验证)。
++///
++/// 角度/角速度均为 ROS 系语义: `angle` 即 yaw (绕 +Z, rad), 与 Bevy 绕 +Y 转角同号。
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SpinGt {
++    /// 旋转模式编码: 0=恒定, 1=规律变速, 2=不规则变速, 3=慢速匀速, 4=三角波
++    pub mode: u8,
++    /// 累计转角 (rad, 即 ROS yaw)
++    pub angle: f64,
++    /// 当前角速度 (rad/s)
++    pub omega: f64,
++    /// 当前积分所用角加速度 (rad/s², 保持段为 0)
++    pub alpha: f64,
++    /// 目标角速度 (rad/s, 保持段等于当前角速度)
++    pub target: f64,
++    /// 阶段编码: 0=变速, 1=保持
++    pub phase: u8,
++    /// 最近一次阶段切换的仿真时间 (s)
++    pub event_t: f64,
++    /// 三角波模式的单程加速时间 (s); 其余模式为配置值, 不参与曲线
++    pub t_acc: f64,
++}
+ 
+ /// 真值 UDP 发送器
+ pub struct GtUdpSender {
+@@ -87,20 +115,32 @@
+     /// 发送一帧真值。
+     ///
+     /// - `timestamp`: 仿真时间 (秒)
++    /// - `enemy_center`: 敌方步兵车体中心 (ROS 系); 无敌方实体时为 None
+     /// - `armors`: 4 块敌方装甲板位置, 顺序固定; 缺位用 None (JSON 里该字段省略)
++    /// - `spin`: 敌方步兵变速小陀螺状态; 无敌方实体时为 None (相关字段省略)
+     pub fn send(
+         &self,
+         timestamp: f64,
+         gimbal_yaw: f64,
+         gimbal_pitch: f64,
+         gimbal_pos: [f64; 3],
++        enemy_center: Option<[f64; 3]>,
+         armors: &[Option<[f64; 3]>; 4],
++        spin: Option<SpinGt>,
+     ) {
+         let Some(socket) = self.socket.as_ref() else {
+             return;
+         };
+ 
+-        let payload = build_json(timestamp, gimbal_yaw, gimbal_pitch, gimbal_pos, armors);
++        let payload = build_json(
++            timestamp,
++            gimbal_yaw,
++            gimbal_pitch,
++            gimbal_pos,
++            enemy_center,
++            armors,
++            spin,
++        );
+         if let Err(err) = socket.send_to(payload.as_bytes(), &self.target) {
+             // 只在第一次失败时吵闹, 避免刷屏 —— 这里简单 warn 一次也可接受
+             warn!("[GT-UDP] 发送失败 (target={}): {err:?}", self.target);
+@@ -115,10 +155,12 @@
+     gimbal_yaw: f64,
+     gimbal_pitch: f64,
+     gimbal_pos: [f64; 3],
++    enemy_center: Option<[f64; 3]>,
+     armors: &[Option<[f64; 3]>; 4],
++    spin: Option<SpinGt>,
+ ) -> String {
+     // 预分配一个够用的容量, 减少 realloc
+-    let mut s = String::with_capacity(512);
++    let mut s = String::with_capacity(900);
+     s.push_str("{\"timestamp\":");
+     push_f64(&mut s, timestamp);
+     s.push_str(",\"gt\":{");
+@@ -136,6 +178,16 @@
+     push_f64(&mut s, gimbal_pos[1]);
+     s.push_str(",\"gimbal_z\":");
+     push_f64(&mut s, gimbal_pos[2]);
++
++    // 敌方步兵车体中心 (装甲板位置 = 车体中心 + Rz(spin_angle) · 局部偏移)
++    if let Some(c) = enemy_center {
++        s.push_str(",\"enemy_center_x\":");
++        push_f64(&mut s, c[0]);
++        s.push_str(",\"enemy_center_y\":");
++        push_f64(&mut s, c[1]);
++        s.push_str(",\"enemy_center_z\":");
++        push_f64(&mut s, c[2]);
++    }
+ 
+     // 4 块装甲板: 展平成 armor_1_x / armor_1_y / armor_1_z ...
+     for (i, armor) in armors.iter().enumerate() {
+@@ -155,6 +207,26 @@
+         push_f64(&mut s, p[2]);
+     }
+ 
++    // 敌方步兵变速小陀螺真值 (曲线对齐用)
++    if let Some(sp) = spin {
++        s.push_str(",\"spin_mode\":");
++        push_u32(&mut s, sp.mode as u32);
++        s.push_str(",\"spin_angle\":");
++        push_f64(&mut s, sp.angle);
++        s.push_str(",\"spin_omega\":");
++        push_f64(&mut s, sp.omega);
++        s.push_str(",\"spin_alpha\":");
++        push_f64(&mut s, sp.alpha);
++        s.push_str(",\"spin_target\":");
++        push_f64(&mut s, sp.target);
++        s.push_str(",\"spin_phase\":");
++        push_u32(&mut s, sp.phase as u32);
++        s.push_str(",\"spin_event_t\":");
++        push_f64(&mut s, sp.event_t);
++        s.push_str(",\"spin_t_acc\":");
++        push_f64(&mut s, sp.t_acc);
++    }
++
+     s.push_str("}}");
+     s
+ }
+@@ -164,7 +236,7 @@
+ fn push_f64(s: &mut String, v: f64) {
+     if v.is_finite() {
+         // 用 {:?} 打印 f64, Rust 会给出最短往返表示, 精度足够
+-        s.push_str(&format!("{v:?}"));
++        write!(s, "{v:?}").expect("writing to a String cannot fail");
+     } else {
+         s.push_str("null");
+     }
+@@ -172,5 +244,5 @@
+ 
+ #[inline]
+ fn push_u32(s: &mut String, v: u32) {
+-    s.push_str(&v.to_string());
+-}
++    write!(s, "{v}").expect("writing to a String cannot fail");
++}
+--- a/src/ros2/plugin.rs
++++ b/src/ros2/plugin.rs
+@@ -1,10 +1,12 @@
+ use crate::ros2::capture::{CaptureCamera, CaptureConfig, RosCaptureContext, RosCapturePlugin};
+-use crate::ros2::gt_udp::GtUdpSender;
++use crate::ros2::gt_udp::{GtUdpSender, SpinGt};
+ use crate::ros2::topic::*;
++use crate::spin::{SpinConfig, SpinState};
+ use crate::{
+     Armor, EnemyArmor, InfantryGimbal, InfantryViewOffset, LocalInfantry, arc_mutex, publisher,
+     robomaster::power_rune::{PowerRune, RuneIndex},
+ };
++use bevy::mesh::VertexAttributeValues;
+ use bevy::prelude::*;
+ use bevy::render::render_resource::TextureFormat;
+ use futures::{
+@@ -132,13 +134,15 @@
+ pub struct AutoAimBridge(Arc<Mutex<AutoAimState>>);
+ 
+ impl AutoAimBridge {
+-    fn update(&self, topic: &'static str, command: AutoAimCommand) {
++    fn update(&self, topic: &'static str, command: AutoAimCommand, shotlog: &crate::shotlog::ShotLog) {
+         let mut state = self.0.lock().unwrap();
+         let now = Instant::now();
+         if command.distance < 0.0 {
+             state.pending_fire_at = None;
+         } else if command.fire_advice {
+             state.pending_fire_at = Some(now);
++            // 逐发埋点: 记下 fire 请求到达时刻(与离膛时刻对齐用)。
++            shotlog.on_fire_request(command.yaw, command.pitch, command.distance);
+         }
+         state.last_command = Some(command);
+         state.last_received_at = Some(now);
+@@ -191,6 +195,7 @@
+     topic: &'static str,
+     mut subscription: S,
+     auto_aim: AutoAimBridge,
++    shotlog: crate::shotlog::ShotLog,
+ ) where
+     S: Stream<Item = r2r::Result<Value>> + Unpin + 'static,
+ {
+@@ -199,7 +204,7 @@
+             match message {
+                 Ok(message) => {
+                     if let Some(command) = parse_auto_aim_command(&message) {
+-                        auto_aim.update(topic, command);
++                        auto_aim.update(topic, command, &shotlog);
+                     } else {
+                         warn!("Malformed auto aim message on {topic}: {message}");
+                     }
+@@ -219,6 +224,7 @@
+     node: &mut Node,
+     spawner: &futures::executor::LocalSpawner,
+     auto_aim: AutoAimBridge,
++    shotlog: crate::shotlog::ShotLog,
+ ) {
+     match node.subscribe_untyped(
+         AUTO_AIM_TOPIC,
+@@ -227,7 +233,7 @@
+     ) {
+         Ok(subscription) => {
+             info!("Subscribed to {AUTO_AIM_TOPIC} for auto aim control.");
+-            spawn_auto_aim_subscription(spawner, AUTO_AIM_TOPIC, subscription, auto_aim);
++            spawn_auto_aim_subscription(spawner, AUTO_AIM_TOPIC, subscription, auto_aim, shotlog);
+         }
+         Err(err) => {
+             warn!(
+@@ -342,6 +348,31 @@
+ #[derive(Resource)]
+ pub struct GtUdp(pub GtUdpSender);
+ 
++/// 求网格所有顶点在世界系下的质心。
++///
++/// 为什么不能用 `GlobalTransform.translation`:
++/// `vehicle.glb` 里 `ARMOR_n_P` 节点相对 BASE 的**净变换是单位阵**
++/// (例如 `ARMOR_3_P` 的 `-0.2095` 恰好被父节点 `AM_3` 的 `+0.2095` 抵消, 1/2/4 号同理),
++/// 节点原点永远落在旋转轴上 (= 车体中心), 四块装甲板会报成同一个点且不随旋转变化。
++/// 真实的装甲板偏移烘在 mesh 顶点里, 所以必须走顶点。
++///
++/// 每块装甲板 mesh 只有 4 个顶点, 4 块合计 16 个, 调用成本可忽略。
++/// `pub(crate)`: 命中计数 (main.rs::count_infantry_hit) 也要用它算板心。
++pub(crate) fn mesh_world_centroid(gt: &GlobalTransform, mesh: &Mesh) -> Option<Vec3> {
++    let mut sum = Vec3::ZERO;
++    let mut count = 0usize;
++    for (_attr, values) in mesh.attributes() {
++        if let VertexAttributeValues::Float32x3(vec) = values {
++            for &p in vec {
++                sum += gt.transform_point(Vec3::from(p));
++                count += 1;
++            }
++            break;
++        }
++    }
++    (count > 0).then(|| sum / count as f32)
++}
++
+ fn capture_rune(
+     camera: Single<&GlobalTransform, With<CaptureCamera>>,
+     gimbal: Single<&GlobalTransform, (With<LocalInfantry>, With<InfantryGimbal>)>,
+@@ -351,7 +382,14 @@
+     targets: Query<(&GlobalTransform, &RuneIndex, &Name)>,
+ 
+     // 敌方装甲板真值: 用于跨机真值链路 (/tf 中发布 enemy_armor_* 帧)
+-    enemy_armors: Query<(&GlobalTransform, &Armor), With<EnemyArmor>>,
++    // 注意: 位置必须由 mesh 顶点质心求得, 不能用节点原点 (见 mesh_world_centroid 注释)
++    enemy_armors: Query<(&GlobalTransform, &Mesh3d, &Armor), With<EnemyArmor>>,
++    armor_meshes: Res<Assets<Mesh>>,
++
++    // 敌方步兵变速小陀螺状态 (仅敌方实体持有 SpinState)
++    // 同时取该实体的 GlobalTransform 作为车体中心 (SpinState 与 InfantryRoot 挂在同一实体上)
++    enemy_spin: Query<(&SpinState, &GlobalTransform)>,
++    spin_cfg: Res<SpinConfig>,
+ 
+     clock: ResMut<RoboMasterClock>,
+     tf_publisher: ResMut<TopicPublisher<GlobalTransformTopic>>,
+@@ -446,12 +484,20 @@
+     }
+ 
+     // 敌方装甲板真值 -> /tf, 供 Linux 小主机订阅 (enemy_armor_<NAME> 帧)
+-    for (armor_transform, Armor(armor_name)) in &enemy_armors {
++    // 平移取 mesh 顶点世界质心; 姿态沿用装甲板节点的世界旋转。
++    for (armor_transform, armor_mesh, Armor(armor_name)) in &enemy_armors {
++        let Some(center) = armor_meshes
++            .get(armor_mesh)
++            .and_then(|m| mesh_world_centroid(armor_transform, m))
++        else {
++            continue;
++        };
+         add_tf_frame!(
+             transform_stamped,
+             root_hdr.clone(),
+             format!("enemy_armor_{}", armor_name).to_lowercase(),
+-            armor_transform.compute_transform()
++            center,
++            armor_transform.rotation()
+         );
+     }
+ 
+@@ -468,20 +514,46 @@
+     let gimbal_pos_ros = M_ALIGN_MAT3 * gimbal_pose.translation;
+ 
+     // 4 块装甲板位置: 按名称 ARMOR_1_P ~ ARMOR_4_P 固定顺序, 缺位为 None
++    // 位置 = 该装甲板 mesh 顶点的世界质心 (节点原点不可用, 见 mesh_world_centroid)
+     let mut armors: [Option<[f64; 3]>; 4] = [None, None, None, None];
+     for idx in 1..=4u32 {
+         let want = format!("armor_{}_p", idx);
+-        let found = enemy_armors.iter().find_map(|(t, Armor(name))| {
++        let found = enemy_armors.iter().find_map(|(gt, mesh, Armor(name))| {
+             if name.to_lowercase() == want {
+-                Some(M_ALIGN_MAT3 * t.compute_transform().translation)
++                armor_meshes
++                    .get(mesh)
++                    .and_then(|m| mesh_world_centroid(gt, m))
+             } else {
+                 None
+             }
+         });
+         if let Some(p) = found {
++            let p = M_ALIGN_MAT3 * p;
+             armors[(idx - 1) as usize] = Some([p.x as f64, p.y as f64, p.z as f64]);
+         }
+     }
++
++    // 敌方步兵变速小陀螺真值 + 车体中心 (取第一个持有 SpinState 的敌方实体)
++    // 注: angle 为 Bevy 绕 +Y 转角, 经 M_ALIGN_MAT3 对齐后即 ROS 系绕 +Z 的 yaw, 二者同号。
++    let (spin_gt, enemy_center) = match enemy_spin.iter().next() {
++        Some((s, gt)) => {
++            let c = M_ALIGN_MAT3 * gt.compute_transform().translation;
++            (
++                Some(SpinGt {
++                    mode: spin_cfg.mode.as_u8(),
++                    angle: s.angle,
++                    omega: s.omega,
++                    alpha: s.alpha_now,
++                    target: s.target,
++                    phase: s.phase.as_u8(),
++                    event_t: s.event_t,
++                    t_acc: spin_cfg.t_acc,
++                }),
++                Some([c.x as f64, c.y as f64, c.z as f64]),
++            )
++        }
++        None => (None, None),
++    };
+ 
+     let stamp_sec = stamp.sec as f64 + stamp.nanosec as f64 * 1e-9;
+     gt_udp.0.send(
+@@ -489,7 +561,9 @@
+         gimbal_yaw as f64,
+         gimbal_pitch as f64,
+         [gimbal_pos_ros.x as f64, gimbal_pos_ros.y as f64, gimbal_pos_ros.z as f64],
++        enemy_center,
+         &armors,
++        spin_gt,
+     );
+ }
+ 
+@@ -510,6 +584,15 @@
+     }
+ }
+ 
++/// 读一个分辨率维度环境变量, 非法值回退默认 (合法范围 64..=4096)。
++fn env_dim(key: &str, default: u32) -> u32 {
++    std::env::var(key)
++        .ok()
++        .and_then(|s| s.trim().parse::<u32>().ok())
++        .filter(|v| (64..=4096).contains(v))
++        .unwrap_or(default)
++}
++
+ #[derive(Default)]
+ pub struct ROS2Plugin {}
+ 
+@@ -532,16 +615,47 @@
+         let image_raw = Arc::new(publisher!(signal_arc, node, ImageRawTopic));
+         let image_compressed = Arc::new(publisher!(signal_arc, node, ImageCompressedTopic));
+ 
++        // 图像话题发布开关: IMAGE_PUB = raw | compressed | both | none  (默认 compressed)
++        let (image_pub_raw, image_pub_compressed) = {
++            let v = std::env::var("IMAGE_PUB").unwrap_or_else(|_| "compressed".to_string());
++            let v = v.trim().to_ascii_lowercase();
++            let raw = matches!(v.as_str(), "raw" | "both");
++            let compressed = matches!(v.as_str(), "compressed" | "both");
++            if !raw && !compressed && v != "none" {
++                warn!(
++                    "IMAGE_PUB=\"{v}\" 无法识别 (应为 raw/compressed/both/none), 按 compressed 处理"
++                );
++                (false, true)
++            } else {
++                (raw, compressed)
++            }
++        };
++        info!(
++            "[IMAGE] IMAGE_PUB => publish_raw={image_pub_raw} publish_compressed={image_pub_compressed} jpeg_quality={}",
++            crate::util::image::jpeg_quality()
++        );
++
++        // 采集分辨率: CAPTURE_WIDTH / CAPTURE_HEIGHT (默认 960x720)
++        // 内参由 capture.rs::compute_camera 从 fov_y + 分辨率重算 (f_x == f_y 恒成立),
++        // 所以改分辨率后自瞄从 /camera_info 读到的新内参可以直接用。
++        let capture_width = env_dim("CAPTURE_WIDTH", 960);
++        let capture_height = env_dim("CAPTURE_HEIGHT", 720);
++        info!(
++            "[IMAGE] capture resolution => {capture_width}x{capture_height} (CAPTURE_WIDTH / CAPTURE_HEIGHT)"
++        );
++
+         let clock = arc_mutex!(Clock::create(SystemTime).unwrap());
++        let shotlog = crate::shotlog::ShotLog::from_env();
+ 
+         app.insert_resource(RoboMasterClock(clock.clone()))
+             .insert_resource(auto_aim.clone())
++            .insert_resource(shotlog.clone())
+             .insert_resource(GtUdp(GtUdpSender::from_env()))
+             .insert_resource(StopSignal(signal_arc.clone()))
+             .add_plugins(RosCapturePlugin {
+                 config: CaptureConfig {
+-                    width: 960,
+-                    height: 720,
++                    width: capture_width,
++                    height: capture_height,
+                     texture_format: TextureFormat::bevy_default(),
+                     fov_y: PI / 180.0 * 45.0,
+                 },
+@@ -550,6 +664,8 @@
+                     camera_info,
+                     image_raw,
+                     image_compressed,
++                    publish_raw: image_pub_raw,
++                    publish_compressed: image_pub_compressed,
+                 },
+             })
+             .add_systems(Last, cleanup_ros2_system)
+@@ -557,7 +673,7 @@
+             .insert_resource(SpinThreadHandle(Some(thread::spawn(move || {
+                 let mut pool = LocalPool::new();
+                 let spawner = pool.spawner();
+-                setup_auto_aim_subscriptions(&mut node, &spawner, auto_aim);
++                setup_auto_aim_subscriptions(&mut node, &spawner, auto_aim, shotlog);
+                 setup_mode_service_client(&mut node, &spawner, RUNE_DETECTOR_SET_MODE_SERVICE);
+                 setup_mode_service_client(&mut node, &spawner, RUNE_SOLVER_SET_MODE_SERVICE);
+ 
+--- a/src/ros2/topic.rs
++++ b/src/ros2/topic.rs
+@@ -3,7 +3,25 @@
+ use r2r::sensor_msgs::msg::{CameraInfo, CompressedImage, Image};
+ use r2r::tf2_msgs::msg::TFMessage;
+ use r2r::{QosProfile, WrappedTypesupport};
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::mpsc::SyncSender;
++
++// ─────────────────────────────────────────────────────────────────────────────
++// [CAM] 发送侧失败计数 (2026-10-13 加入, 见 ros2/capture.rs 顶部注释)
++//   这两处失败原来都是**静默**的:
++//     1. TopicPublisher::publish 用 try_send, 通道(1024)满了直接丢帧
++//     2. publisher 线程里 publisher.publish() 报错时, while !sent 循环丢队列再重试
++//   出图率异常低时, 靠这两个计数区分「采集没出图」和「出了图发不出去」。
++// ─────────────────────────────────────────────────────────────────────────────
++// `publisher!` 是 #[macro_export]，会在调用点(crate 内)展开成
++// `crate::ros2::topic::PUB_WRITE_ERR`，所以这两个计数必须是 pub。
++pub static PUB_WRITE_ERR: AtomicU64 = AtomicU64::new(0);
++pub static PUB_TRY_SEND_ERR: AtomicU64 = AtomicU64::new(0);
++
++/// 取出并清零自上次调用以来的发送失败数（供 [CAM] 日志用）。
++pub fn take_publish_errors() -> u64 {
++    PUB_WRITE_ERR.swap(0, Ordering::Relaxed) + PUB_TRY_SEND_ERR.swap(0, Ordering::Relaxed)
++}
+ 
+ #[derive(Resource)]
+ pub struct TopicPublisher<T: RosTopic> {
+@@ -16,7 +34,9 @@
+     }
+ 
+     pub fn publish(&self, message: T::T) {
+-        let _ = self.sender.try_send(message);
++        if self.sender.try_send(message).is_err() {
++            PUB_TRY_SEND_ERR.fetch_add(1, Ordering::Relaxed);
++        }
+     }
+ }
+ 
+@@ -51,6 +71,8 @@
+                                 match publisher.publish(&m) {
+                                     Ok(_) => sent = true,
+                                     Err(_) => {
++                                        crate::ros2::topic::PUB_WRITE_ERR
++                                            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+                                         let _ = receiver.try_recv();
+                                     }
+                                 }
+--- a/src/util/image.rs
++++ b/src/util/image.rs
+@@ -1,5 +1,38 @@
+ use r2r::sensor_msgs::msg::CompressedImage;
+ use r2r::std_msgs::msg::Header;
++
++/// JPEG 压缩质量 (1-100)，由环境变量 `JPEG_QUALITY` 控制，**默认 95**。
++///
++/// 历史默认是 75（`JpegEncoder::new()` 的默认值）。2026-10-11 重新实测
++/// （960x720, 本机 -> 自瞄 2.5Gbps 有线, 每种质量 20 s x2）：
++///
++/// | 质量 | 帧大小 | 带宽 | 实测出图率 |
++/// |---|---|---|---|
++/// | 75  | ~20 KB  | ~8 Mbps  | (未测, 与 95 同级) |
++/// | 95  | 48.8 KB | 18~21 Mbps | 54.4 / 46.8 Hz |
++/// | 100 | 194.8 KB| 75 Mbps  | 47.99 / 47.81 Hz |
++///
++/// **结论：JPEG 质量对帧率没有可测影响。** 编码跑在 `AsyncComputeTaskPool` 里
++/// 异步执行，而瓶颈是 GPU->CPU 回读（约 20 ms/帧，连 60 Hz 的 `RateLimiter` 都到不了），
++/// 所以提高质量是"免费"的。轮间抖动（47~54 Hz）比质量带来的差异还大。
++///
++/// 另外：`image` 0.25.8 的编码器**实际输出 4:4:4**（SOF 里三个分量 h=1 v=1），
++/// 源码里那句 "subsampling ratio 4:2:2" 的注释是过时的 —— 所以没有色度抽样损失，
++/// q100 时量化表全为 1，已经接近无损，JPEG 这条路到头了。
++/// 想要真正无损只能走 `/image_raw`（736 Mbps），但那会破坏自瞄对
++/// `/image_compressed` 的订阅，不划算。
++///
++/// 想回退到旧行为：`set JPEG_QUALITY=75`（**不用重编**）。
++pub fn jpeg_quality() -> u8 {
++    static QUALITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
++    *QUALITY.get_or_init(|| {
++        std::env::var("JPEG_QUALITY")
++            .ok()
++            .and_then(|s| s.trim().parse::<u8>().ok())
++            .filter(|q| (1..=100).contains(q))
++            .unwrap_or(95)
++    })
++}
+ 
+ pub fn compress_image(header: Header, width: u32, height: u32, data: Vec<u8>) -> CompressedImage {
+     use image::codecs::jpeg::JpegEncoder;
+@@ -10,7 +43,7 @@
+         ImageBuffer::from_raw(width, height, data).unwrap();
+ 
+     let mut cursor = Cursor::new(Vec::new());
+-    let mut encoder = JpegEncoder::new(&mut cursor);
++    let mut encoder = JpegEncoder::new_with_quality(&mut cursor, jpeg_quality());
+     encoder.encode_image(&buffer).expect("JPEG encode failed");
+     let compressed_data = cursor.into_inner();
+ 

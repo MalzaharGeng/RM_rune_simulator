@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  FastDDS profile for daedalus (Windows publisher side).
+
+  WHY THIS FILE EXISTS
+  -------------------------------------------------------------------------
+  The simulator publishes /image_compressed to the aimer (Linux). One JPEG
+  frame at quality=100 is about 196 KB. FastDDS' UDPv4 transport defaults to
+  maxMessageSize = 65500, so:
+
+    196 KB frame
+      -> split into 3 RTPS submessages of 65500 bytes each
+      -> each one IP-fragmented into ~44 fragments (MTU 1500)
+      -> sending 4 frames at once = 12 datagrams = ~528 IP fragments,
+         all fired within a few milliseconds
+
+  The receiver's (Linux) IP reassembly buffer is overwhelmed by that burst,
+  most fragments are dropped and the whole frame is discarded. RELIABLE QoS
+  only retransmits on its heartbeatPeriod, which defaults to 3 seconds, so
+  the aimer sees roughly one frame every 3 seconds. Measured on the wire:
+    [Tracker] Large dt: 2.96~3.01s  (89 times / 255 s)
+    RawPnP spacing pinned at exactly 3.000 s
+    effective frame rate ~0.33 Hz, [Control] enabled=true only 5%
+
+  THE FIX
+  -------------------------------------------------------------------------
+  Cap maxMessageSize at an MTU-safe value (1400) so no UDP datagram ever
+  triggers IP fragmentation. FastDDS then fragments at the RTPS layer
+  (DATA_FRAG), where each fragment is an independently retransmittable unit,
+  so losing one fragment only costs that one fragment instead of a 3-second
+  heartbeat wait. Socket buffers are also enlarged to absorb bursts.
+
+  NOTE
+  -------------------------------------------------------------------------
+  No interfaceWhiteList is set here, on purpose: which NIC is used is left to
+  the OS routing table so this stays portable across machines. Only add a
+  whitelist if a real "DDS picked the wrong NIC" problem shows up.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_transport</transport_id>
+            <type>UDPv4</type>
+            <maxMessageSize>1400</maxMessageSize>
+            <sendBufferSize>8388608</sendBufferSize>
+            <receiveBufferSize>8388608</receiveBufferSize>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="daedalus_participant" is_default_profile="true">
+        <rtps>
+            <userTransports>
+                <transport_id>udp_transport</transport_id>
+            </userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+
+</profiles>

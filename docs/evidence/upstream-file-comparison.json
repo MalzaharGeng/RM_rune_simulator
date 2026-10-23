@@ -1,0 +1,102 @@
+[
+  {
+    "path": "src/dataset/prelude.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/dataset/writer.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/dataset.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/handler.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/main.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/robomaster/power_rune.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/robomaster/visibility.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/robomaster.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/ros2/capture.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/ros2/gt_udp.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/ros2/plugin.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/ros2/topic.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/ros2.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/shotlog.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/spin.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/statistic.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/util/bevy.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/util/image.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/util/sync.rs",
+    "upstream_master_same_path": false,
+    "identical_bytes_to_master": false
+  },
+  {
+    "path": "src/util.rs",
+    "upstream_master_same_path": true,
+    "identical_bytes_to_master": false
+  }
+]

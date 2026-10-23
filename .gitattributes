@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.rs text eol=lf
+src/** -text
+src/** whitespace=cr-at-eol
+docs/evidence/*.patch -text
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf
+*.glb binary
+*.ogg binary
+*.png binary
+pixi.lock linguist-generated=true
