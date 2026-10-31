@@ -1,21 +1,80 @@
 # RM Rune Simulator · Combat 战队自瞄仿真
 
-这个仓库是**南京理工大学江阴校区 Combat 战队**的自瞄仿真环境，基于 [Blackjack200 / Daedalus](https://github.com/Blackjack200/bevy_robomaster_simulator) 适配。用途是在不占用实车的前提下，反复验证自瞄链路上的几个环节：图像采集、检测与跟踪、云台控制、小陀螺预测和开火决策。能量机关场景沿用上游，没有删除。
+**南京理工大学江阴校区 Combat 战队的自瞄仿真环境**，基于 [Blackjack200 / Daedalus](https://github.com/Blackjack200/bevy_robomaster_simulator) 适配。
 
-**我们实际是两台机器一起跑：** Windows 这台（RTX 5070 Ti）负责渲染、物理和云台执行，Linux 那台运行自瞄，两者通过局域网 ROS 2 Jazzy / FastDDS 通信。自瞄算法会放在独立仓库，发布后在这里补链接；本仓库只包含仿真端、接口定义和部署脚本。
+真机迭代的大部分时间花在等：等车、等场地、等一次能完整跑下来的机会。一个下午能试的参数很有限，出了偏差也不容易分清是算法问题还是机械问题。仿真提供的是可重复的单一变量实验，在不占用实车的前提下反复验证自瞄链路上的几个环节：图像采集、检测与跟踪、云台控制、小陀螺预测和开火决策。能量机关场景沿用上游，没有删除。
 
-上游背景见 [河北科技大学 Actor&Thinker 战队 RM2026 视觉算法仿真器开源](https://bbs.robomaster.com/article/1887395?source=4)。原作者为 Blackjack200 / Actor&Thinker，本仓库维护者 [MalzaharGeng](https://github.com/MalzaharGeng)。许可证沿用 **AGPL-3.0**，自定义消息包保留上游的 Apache-2.0。
-
-**如果只是想先跑起来，用便携包最省事。** 仓库包含全部仿真源码、5 个模型/音效资源、消息定义和依赖锁文件；可执行程序和 ROS DLL 放在版本化的 [Release](https://github.com/MalzaharGeng/RM_rune_simulator/releases/tag/v2026.10.23)。首次获取需要联网，之后可以离线运行。便携包不要求安装 Rust、ROS、Python 或 Visual Studio，但需要 Windows x64 和支持 Bevy/wgpu 的显卡驱动。
+**我们实际是两台机器一起跑：** Windows 这台（RTX 5070 Ti）负责渲染、物理和云台执行，Linux 那台运行自瞄，两者通过局域网 ROS 2 Jazzy / FastDDS 通信。自瞄算法在独立仓库，本仓库只包含仿真端、接口定义和部署脚本。
 
 > 仓库名沿用 rune，但当前默认场景不是打符，而是 **4 m 前方、7.5 rad/s 恒速旋转的敌方步兵**。自瞄算法、网络权重、真机驱动和 PlotJuggler 本体都不在本仓库内。只运行仿真时，可以看到场景和真值；自动瞄准与自动开火需要接入外部自瞄节点。
+
+## 与上游的差异
+
+这不是上游的升级版，也不是完整复刻。上游 master 已经演进成多目标 / Talos 架构，本仓库是从较早的单体分支整理出来的，面向"Windows 仿真 + Linux 自瞄"这一条闭环。两边解决的问题不同，功能多少不能直接比较。
+
+对比基准：公开上游 `Blackjack200/bevy_robomaster_simulator`，2026-10-23 读取的 master 为 `4368125`（该提交日期为 2026-09-03）。本机原工程没有 `.git`，无法证明它最初下载自哪个 commit，因此下表只描述能核对到的差异，不宣称精确分叉点。
+
+| 环节 | 上游当前 master | 本仓库 | 可核对的变化 |
+|---|---|---|---|
+| 定位 | 多目标仿真、ROS / Talos | 战队 ROS 图像与自瞄闭环、小陀螺实验 | 面向单条闭环，参数可复现 |
+| 引擎 | 已演进，见上游 `Cargo.toml` | 保留 Bevy 0.17.2 / Avian3D 0.4 | — |
+| 源码组织 | scene / systems / config，多 crates | 单体 `main` + `ros2` + `power_rune`，新增 `spin` / `shotlog` | `spin.rs` 1069 行、19 个单元测试 |
+| 云台接口 | 说明含 armor_solver / Talos | `rune_solver/cmd_gimbal`，固定本机消息定义 | Linux 侧不改接口即可接入 |
+| 场景可复现 | 车体可自由漂移 | 敌方 XZ 钉住、我方出生点钉住 | 修掉实测滑走约 **5.4 m** 的问题 |
+| 真值 | 无独立真值链路 | UDP 9870 JSON，含云台角、敌方中心、4 块板中心 | 不占用 ROS 真值话题 |
+| 命中统计 | 单一计数 | 总命中 / 近侧命中并列，`[HITSTAT]` 每 2 s 落盘 | 命中率从"一个数"变成"能解释的数" |
+| 几何一致性 | 15° 内倾只转 `_P`，支点按局部算 | 改到 `AM_n` 父节点、支点 `c_world = t_am + t_p + c` | `{A1,A3}=240.2 mm`、`{A2,A4}=226.2 mm`，档差 14.0 mm 成对一致 |
+| 传输 | 默认 DDS 缓冲 | `maxMessageSize=1400` + 8 MB socket buffer | 修掉 q100 帧退化成约 **3 秒一帧** |
+| 分发 | 需自行编译 | 版本化 Release 便携包 + 开发构建分离 | 不装 Rust/ROS 也能跑 |
+
+### 具体改动
+
+**1. 接口对齐现有自瞄**
+
+`rm_interfaces` 消息与服务源码随仓库发布，`GimbalCmd` 的度转弧度在 `src/ros2/plugin.rs` 完成。仿真订阅 `/rune_solver/cmd_gimbal`，并作为客户端调用 `set_mode`；服务缺失只告警，不算启动失败。这样 Linux 侧不用为了仿真改接口。
+
+**2. 场景从"能跑"变成"能复现"**
+
+- 新增 `src/spin.rs`：5 种旋转模式、f64 积分、固定随机种子，1069 行、19 个单元测试。相对本机改造前的固定自转场景，增加了变速与换向实验能力；这里不据此判断上游后续版本的能力。
+- 敌方 XZ 固定（`ENEMY_X` / `ENEMY_Z`），我方出生点钉住、按键解除（`PIN_LOCAL_INFANTRY`）。原因是车体 `LinearDamping=0` 且出生点与符重合，实测会滑走约 5.4 m，"前方 4 m"就不可复现。
+- 运动同时写 `Transform` 与物理 `Rotation`。只写前者会被物理回写覆盖，姿态滞后一个固定步，18 rad/s 时约 10°。
+
+**3. 真值独立成链路**
+
+- UDP 9870 输出 JSON，含云台角与位置、敌方中心、4 块板中心、`spin_*` 状态；不占用 ROS 真值话题，也不影响自瞄订阅。
+- 板中心取 mesh 顶点世界质心，不取节点原点。GLB 里 `ARMOR_n_P` 相对 BASE 的净变换是单位阵，节点原点会退化成同一点，4 块板报成同一个位置。
+- 代价是跨程序比较前必须统一坐标、单位、时钟和采样时刻，否则数字对不上。
+
+**4. 命中率从"一个数"变成"能解释的数"**
+
+- `statistic.rs` 并列总命中与近侧命中，`[HITSTAT]` 每 2 s 落日志，后台运行也能读。
+- `shotlog.rs` 逐发记录 req / launch / hit / miss，用 `shot_id` 严格关联，可以算 fire→launch 延迟。
+- 两者都只观测，不改变开火决策；`SHOT_LOG` 不设时模块整体短路。
+
+**5. 几何一致性修正（本仓库最实质的 bug fix）**
+
+- 15° 内倾改到 `AM_n` 父节点上，灯条、编号、模块一起倾斜。只转 `_P` 会导致画面竖直、真值内倾，两者对不上。
+- 支点改为 `c_world = t_am + t_p + c`。旧写法 `c_local = t_p + c` 让 `AM_3/AM_4` 绕车心旋转，板心竖直错位约 57 mm；修复后 `{A1,A3}=240.2 mm`、`{A2,A4}=226.2 mm`，档差 14.0 mm 成对一致。
+- 代理面尺寸归一到 137.80×59.84 mm（GLB 灯条外缘）。与自瞄 PnP 的 135.7×56 mm 模型仍有约 +1.5% / +6.9% 差异，属于已知残差，不是"完全对齐"。
+
+**6. 传输与诊断**
+
+- FastDDS `maxMessageSize=1400` + 8 MB socket buffer。q100 帧约 196 KB，默认 65500 会触发 IP 分片，实测退化成约 3 秒一帧。
+- `[CAM]` 每 2 s 输出采集、回读、发送失败统计，用来区分"没出图"和"出了图发不出去"。
+- `IMAGE_PUB`、`JPEG_QUALITY`、`CAPTURE_WIDTH/HEIGHT` 可配，改分辨率后内参由 `/camera_info` 重算。
+
+**7. 构建与分发可复现**
+
+- `Cargo.lock`、`rust-toolchain.toml`、`pixi.lock`、ROS 包 URL 与 SHA256 全部入库。
+- 运行包与开发构建分离：默认启动不会误用本地未更新的编译产物。
+- 新入口支持配置覆盖和自动 MSVC 检测，不再启动时强杀进程，也不再要求"必须先有 exe 才能编译"。
 
 ## 双机运行方式
 
 ```mermaid
 flowchart LR
     WIN["Windows 本机<br/>RTX 5070 Ti<br/>Daedalus 仿真渲染、云台与弹丸"]
-    LIN["Linux 主机<br/>Ubuntu 24.04.3 / ROS 2 Jazzy<br/>Combat 自瞄算法（独立仓库待发布）"]
+    LIN["Linux 主机<br/>Ubuntu 24.04.3 / ROS 2 Jazzy<br/>Combat 自瞄算法（独立仓库）"]
     DBG["Linux 调试工具<br/>真值记录 / PlotJuggler"]
     WIN -->|"ROS 2：图像、内参、位姿"| LIN
     LIN -->|"ROS 2：GimbalCmd 云台与开火建议"| WIN
@@ -49,7 +108,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download-runtime.ps1
 
 下载脚本会先校验仓库中记录的 SHA256，再解压到 `.runtime/windows/`。双击 `start_rune_simulator.bat` 即可启动。启动脚本不会终止其他仿真进程，也不会在每次启动时重新编译。
 
-便携包来自本机 **2026-10-13 的已编译版本**，本次整理没有重新编译整个仿真器。修改源码后请使用下面的开发入口。
+便携包来自本机 **2026-10-13 的已编译版本**，本次整理没有重新编译整个仿真器。修改源码后请使用下面的开发入口。可执行程序和 ROS DLL 放在版本化的 [Release](https://github.com/MalzaharGeng/RM_rune_simulator/releases/tag/v2026.10.23)，不要求安装 Rust、ROS、Python 或 Visual Studio，但需要 Windows x64 和支持 Bevy/wgpu 的显卡驱动。
 
 ## 修改与构建
 
@@ -105,7 +164,7 @@ Copy-Item config/local.example.json config/local.json
 
 三角波示例：`SPIN_MODE=triangle`、`SPIN_MIN=-4`、`SPIN_MAX=4`、`SPIN_T_ACC=0.5`，对应角加速度绝对值 16 rad/s²、周期 1 s。
 
-需要注意：直接运行 exe、绕开发布脚本时，**源码默认是 triangle / [-4,4]，而不是 slow / 7.5**。这是两套不同的默认值，排查时先确认入口。
+直接运行 exe、绕开发布脚本时，**源码默认是 triangle / [-4,4]，不是 slow / 7.5**。这是两套不同的默认值，排查时先确认入口。
 
 ## ROS 2 与真值接口
 
@@ -165,67 +224,9 @@ near 表示命中时被击中的板外法线朝向炮口，它不等价于"算�
 
 历史自瞄中的 pose 门和 25 s 预热门属于外部 Linux 程序，本仓库不包含这部分实现。
 
-## 与上游（河科大 Actor&Thinker / Daedalus）的区别
+## 哪些不是我们做的
 
-先把关系说清楚：**这不是上游的升级版，也不是完整复刻。** 上游 master 已经演进成多目标 / Talos 架构；本仓库是从较早的单体分支整理出来的，面向我们"Windows 仿真 + Linux 自瞄"这一条闭环。两边解决的问题不同，不能简单比较谁功能多。
-
-对比基准：公开上游 `Blackjack200/bevy_robomaster_simulator`，2026-10-23 读取的 master 为 `4368125`（该提交日期为 2026-09-03）。以下“上游 master”均指这一固定版本。本机原工程没有 `.git`，无法证明它最初下载自哪个 commit，因此下表只描述能核对到的差异，不宣称精确分叉点。
-
-| 方面 | 上游当前 master | 本仓库 |
-|---|---|---|
-| 定位 | 多目标 RoboMaster 仿真、ROS / Talos | 战队 ROS 图像与自瞄闭环、小陀螺实验 |
-| 引擎 | 已演进，见上游 `Cargo.toml` | 保留 Bevy 0.17.2 / Avian3D 0.4 |
-| 源码组织 | scene / systems / config、多个 crates | 单体 `main` + `ros2` + `power_rune`，新增 `spin` / `shotlog` |
-| 资源布局 | 根目录 `assets`，多个机器人 / 战场模型 | `src/assets`，5 个编译嵌入资源 |
-| 云台接口 | 当前说明含 armor_solver / Talos | `rune_solver/cmd_gimbal`，固定本机消息定义 |
-| 场景覆盖 | 已提供能量机关、装甲板、视角控制 | 继承相关功能，默认聚焦固定位置旋转步兵 |
-| 数据集 | 历史路线持续变化 | 保留角点诊断与 writer，未完成自动写出流程 |
-
-### 我们实际加了什么
-
-**1. 接口对齐现有自瞄，而不是另写一套**
-
-`rm_interfaces` 消息与服务源码随仓库发布，`GimbalCmd` 的度转弧度在 `src/ros2/plugin.rs` 完成。仿真订阅 `/rune_solver/cmd_gimbal`，并作为客户端调用 `set_mode`；服务缺失只告警，不算启动失败。这样 Linux 侧不用为了仿真改接口。
-
-**2. 场景从"能跑"变成"能复现"**
-
-- 新增 `src/spin.rs`：5 种旋转模式、f64 积分、固定随机种子，1069 行、19 个单元测试。相对本机改造前的固定自转场景，增加了变速与换向实验能力；这里不据此判断上游后续版本的能力。
-- 敌方 XZ 固定（`ENEMY_X` / `ENEMY_Z`），我方出生点钉住、按键解除（`PIN_LOCAL_INFANTRY`）。原因是车体 `LinearDamping=0` 且出生点与符重合，实测会滑走约 5.4 m，"前方 4 m"就不可复现。
-- 运动同时写 `Transform` 与物理 `Rotation`。只写前者会被物理回写覆盖，姿态滞后一个固定步，18 rad/s 时约 10°。
-
-**3. 真值独立成链路**
-
-- UDP 9870 输出 JSON，含云台角与位置、敌方中心、4 块板中心、`spin_*` 状态；不占用 ROS 真值话题，也不影响自瞄订阅。
-- 板中心取 mesh 顶点世界质心，不取节点原点。GLB 里 `ARMOR_n_P` 相对 BASE 的净变换是单位阵，节点原点会退化成同一点，4 块板报成同一个位置。
-- 代价是跨程序比较前必须统一坐标、单位、时钟和采样时刻，否则数字对不上。
-
-**4. 命中率从"一个数"变成"能解释的数"**
-
-- `statistic.rs` 并列总命中与近侧命中，`[HITSTAT]` 每 2 s 落日志，后台运行也能读。
-- `shotlog.rs` 逐发记录 req / launch / hit / miss，用 `shot_id` 严格关联，可以算 fire→launch 延迟。
-- 两者都只观测，不改变开火决策；`SHOT_LOG` 不设时模块整体短路。
-
-**5. 几何一致性修正（本仓库最实质的 bug fix）**
-
-- 15° 内倾改到 `AM_n` 父节点上，灯条、编号、模块一起倾斜。只转 `_P` 会导致画面竖直、真值内倾，两者对不上。
-- 支点改为 `c_world = t_am + t_p + c`。旧写法 `c_local = t_p + c` 让 `AM_3/AM_4` 绕车心旋转，板心竖直错位约 57 mm；修复后 `{A1,A3}=240.2 mm`、`{A2,A4}=226.2 mm`，档差 14.0 mm 成对一致。
-- 代理面尺寸归一到 137.80×59.84 mm（GLB 灯条外缘）。与自瞄 PnP 的 135.7×56 mm 模型仍有约 +1.5% / +6.9% 差异，属于已知残差，不是"完全对齐"。
-
-**6. 传输与诊断**
-
-- FastDDS `maxMessageSize=1400` + 8 MB socket buffer。q100 帧约 196 KB，默认 65500 会触发 IP 分片，实测退化成约 3 秒一帧。
-- `[CAM]` 每 2 s 输出采集、回读、发送失败统计，用来区分"没出图"和"出了图发不出去"。
-- `IMAGE_PUB`、`JPEG_QUALITY`、`CAPTURE_WIDTH/HEIGHT` 可配，改分辨率后内参由 `/camera_info` 重算。
-
-**7. 构建与分发可复现**
-
-- `Cargo.lock`、`rust-toolchain.toml`、`pixi.lock`、ROS 包 URL 与 SHA256 全部入库。
-- 运行包与开发构建分离：默认启动不会误用本地未更新的编译产物。
-- 新入口支持配置覆盖和自动 MSVC 检测，不再启动时强杀进程，也不再要求"必须先有 exe 才能编译"。
-
-### 哪些不是我们做的
-
-写这一节是为了避免把上游能力算成自己的新增：
+避免把上游能力算成新增：
 
 - 上游既有的能量机关、装甲板、视角控制等功能，本仓库只是继承，不计为新增。
 - 上游 master 的多目标 / Talos 能力，本仓库**没有**。
@@ -275,3 +276,7 @@ start_rune_simulator.bat
 - 修改消息定义时，两端重新编译并 source 同一版本，否则容易出现类型不匹配、到运行期才暴露的问题。
 - 提交功能时附上测试配置、日志窗口、近侧/总命中、发射率和帧率。只给单一最高命中率，无法判断改进是否成立。
 - 私有仓库由所有者在 Settings → Collaborators 邀请队员。
+
+## 来源与许可证
+
+上游背景见 [河北科技大学 Actor&Thinker 战队 RM2026 视觉算法仿真器开源](https://bbs.robomaster.com/article/1887395?source=4)。原作者为 Blackjack200 / Actor&Thinker，本仓库维护者 [MalzaharGeng](https://github.com/MalzaharGeng)。许可证沿用 **AGPL-3.0**，自定义消息包保留上游的 Apache-2.0。
