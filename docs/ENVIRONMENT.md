@@ -4,7 +4,7 @@
 
 南京理工大学江阴校区 Combat 战队采用 Windows / Linux 双机原生运行。Windows 使用 RTX 5070 Ti 渲染仿真；Linux 主机运行自瞄。当前 Windows 运行日志中的具体设备为 NVIDIA GeForce RTX 5070 Ti Laptop GPU。
 
-战队提供的 Linux 主机资料记录：Ubuntu 24.04.3 LTS（noble）、x86_64、约 31 GiB 内存、Intel Raptor Lake-P UHD Graphics 集显，无独立显卡；软件为 ROS 2 Jazzy、OpenVINO 2024.6.0，所列自瞄配置使用 CPU 推理。资料未给出完整 CPU 型号，不根据集显名称推断 CPU 型号。本次仅核对提供文档，未远程重新探测机器。
+战队提供的 Linux 主机资料记录：Ubuntu 24.04.3 LTS（noble）、x86_64、约 31 GiB 内存、Intel Raptor Lake-P UHD Graphics 集显，无独立显卡；软件为 ROS 2 Jazzy、OpenVINO 2024.6.0，所列自瞄配置使用 CPU 推理。资料未给出完整 CPU 型号，也没按集显名称去推断。Linux 那边没有远程登录重新探测过，信息都是照战队给的文档整理的。
 
 本仓库提供 Windows 仿真环境和两端共用的 rm_interfaces；自瞄程序、算法依赖、配置和权重将由后续独立的自瞄仓库说明。跨机连接步骤见 [双机联调说明](DEPLOYMENT.md)。
 
@@ -18,7 +18,7 @@ Release ZIP 与 Git 源码分别管理：源码负责团队修改，Release 提�
 
 | 依赖 | 记录 / 锁定方式 |
 |---|---|
-| Windows / 架构 | Windows x64；本次在原 Windows 主机验证 |
+| Windows / 架构 | Windows x64；在原 Windows 主机上验证 |
 | Rust | 1.98.1，rust-toolchain.toml |
 | Bevy | 0.17.2，Cargo.lock |
 | Avian3D | 0.4 系列，具体解析版本见 Cargo.lock |
@@ -77,8 +77,8 @@ python tools/image_rate_probe.py /image_compressed 20
 
 ## 固定版本与复现边界
 
-官方 ROS 下载的 SHA256：`b2decbc86bdc6103fa839aba49dd320ad7a2e00657e97e8e2778ced0106a58c8`。该下载项已向 GitHub 发布 API 核对；本次没有重新下载并在全新机器从零安装 675 MB 的 ROS ZIP。Pixi 锁文件直接来自当前可用本机环境，未经重新求解。r2r 本地 checkout 没有源码修改，只有 Cargo 的 `.cargo-ok` 标记。
+官方 ROS 下载的 SHA256：`b2decbc86bdc6103fa839aba49dd320ad7a2e00657e97e8e2778ced0106a58c8`。该下载项已向 GitHub 发布 API 核对过。675 MB 的 ROS ZIP 没有重新下载，也没在全新机器上从零装一遍。Pixi 锁文件直接取自当前可用的本机环境，没有重新求解。r2r 的本地 checkout 没有源码修改，只有 Cargo 的 `.cargo-ok` 标记。
 
-运行包针对现有编译产物做了依赖闭包整理和隔离启动验证。整个开发工具链在新 Windows 上的首次安装仍须团队验收；锁定库版本不等于锁定所有驱动、系统更新、Visual Studio 与 LLVM 安装器版本。
+运行包针对现有编译产物做了依赖闭包整理和隔离启动验证。整套开发工具链在新 Windows 上第一次安装，还得团队实际走一遍才算数；锁住库版本不等于锁住所有驱动、系统更新、Visual Studio 和 LLVM 安装器版本。
 
 Linux 自瞄端当前使用 Ubuntu 24.04.3 + ROS 2 Jazzy，并应与 Windows 使用同版本 rm_interfaces。算法本体及权重将在战队单独的自瞄仓库发布，链接待补充；本仓库不从 `_linux_src` 快照自动复制算法。
